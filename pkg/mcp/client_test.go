@@ -4,8 +4,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/shenghuofei/chat-runtime/pkg/config"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/shenghuofei/chat-runtime/pkg/config"
 )
 
 // newClientForLock 构造一个仅用于测试并发锁选择逻辑的 MCPClient（不建立真实连接）。

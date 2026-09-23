@@ -6,15 +6,18 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/chzyer/readline"
 	"github.com/shenghuofei/chat-runtime/pkg/agent"
 	"github.com/shenghuofei/chat-runtime/pkg/config"
 	"github.com/spf13/cobra"
@@ -130,25 +133,39 @@ func runOnce(ctx context.Context, ag *agent.Agent, query string) error {
 
 // runREPL 进入交互式读取-求值-打印循环（REPL）。
 //
-// 关于 Ctrl+C 的处理：在生成过程中按 Ctrl+C 只取消“当前这一次生成”，
-// 而不是退出整个程序；空闲状态下再次按 Ctrl+C（或输入 /quit）才退出。
+// 关于 Ctrl+C 的处理：在生成过程中按 Ctrl+C 只取消"当前这一次生成"，
+// 而不是退出整个程序；空闲状态下按 Ctrl+C 或 Ctrl+D（或输入 /quit）退出。
 func runREPL(ag *agent.Agent) error {
 	printBanner()
 
-	scanner := bufio.NewScanner(os.Stdin)
-	// 允许较长的单行输入（默认 64KB 可能不够）。
-	const maxLine = 1 << 20 // 1MB
-	scanner.Buffer(make([]byte, 0, 64*1024), maxLine)
+	// 历史记录文件：存放在 ~/.chat-runtime/history。
+	homeDir, _ := os.UserHomeDir()
+	historyFile := filepath.Join(homeDir, ".chat-runtime", "history")
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:            "\033[1;36m你 >\033[0m ",
+		HistoryFile:       historyFile,
+		InterruptPrompt:   "^C",
+		EOFPrompt:         "exit",
+		HistorySearchFold: true, // 历史搜索不区分大小写
+	})
+	if err != nil {
+		return fmt.Errorf("初始化 readline 失败: %w", err)
+	}
+	defer rl.Close()
 
 	for {
-		fmt.Print("\n\033[1;36m你 >\033[0m ")
-		if !scanner.Scan() {
-			// EOF（Ctrl+D）或读取错误：优雅退出。
-			fmt.Println("\n再见 👋")
-			return scanner.Err()
+		line, err := rl.Readline()
+		if err != nil {
+			if err == readline.ErrInterrupt || err == io.EOF {
+				// Ctrl+C 或 Ctrl+D：优雅退出。
+				fmt.Println("\n再见 👋")
+				return nil
+			}
+			return err
 		}
 
-		line := strings.TrimSpace(scanner.Text())
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
@@ -164,6 +181,7 @@ func runREPL(ag *agent.Agent) error {
 
 		// 普通输入：执行一次生成，期间支持 Ctrl+C 取消当前生成。
 		runInteractiveTurn(ag, line)
+		fmt.Println() // 回复结束后空一行，与下一轮 prompt 视觉分隔
 	}
 }
 
@@ -188,8 +206,40 @@ func runInteractiveTurn(ag *agent.Agent, input string) {
 		}
 	}()
 
-	fmt.Print("\033[1;32m助手 >\033[0m ")
-	if err := ag.Run(ctx, input, streamToTerminal); err != nil {
+	fmt.Print("\n\033[1;32m助手 >\033[0m \033[90m思考中\033[0m")
+
+	// 启动"思考中..."闪动动画
+	animDone := make(chan struct{})
+	go func() {
+		dots := []string{".", "..", "..."}
+		i := 0
+		ticker := time.NewTicker(400 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-animDone:
+				return
+			case <-ticker.C:
+				// \033[4D 回退4格（"..." + 一个空格的宽度），\033[K 清到行尾
+				fmt.Printf("\033[4D\033[K\033[90m%-3s\033[0m", dots[i%len(dots)])
+				i++
+			}
+		}
+	}()
+
+	firstToken := true
+	if err := ag.Run(ctx, input, func(ev agent.Event) {
+		if firstToken && ev.Type == agent.EventToken {
+			close(animDone) // 停止动画
+			// 清除整行，重新打印"助手 >"
+			fmt.Print("\r\033[K\033[1;32m助手 >\033[0m ")
+			firstToken = false
+		}
+		streamToTerminal(ev)
+	}); err != nil {
+		if firstToken {
+			close(animDone) // 出错时也要停止动画
+		}
 		if errors.Is(err, context.Canceled) {
 			// 用户主动取消，不视为错误。
 			return

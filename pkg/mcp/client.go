@@ -46,6 +46,8 @@ type MCPClient struct {
 	toolMu map[string]*sync.Mutex
 	// noConcurrent 是否整体串行。
 	noConcurrent bool
+	// reconnectMu 防止并发重连。
+	reconnectMu sync.Mutex
 }
 
 // NewMCPClient 依据配置创建并初始化一个 MCP 客户端。
@@ -54,14 +56,15 @@ type MCPClient struct {
 //   - stdio：启动本地子进程，通过 stdin/stdout 通信；
 //   - sse：连接远程 SSE 服务；
 //   - streamable-http：连接远程可流式 HTTP 服务。
-func NewMCPClient(cfg config.MCPServerConfig) (*MCPClient, error) {
+//
+// ctx 用于控制初始化超时与取消，调用方应传入带有合理 deadline 的 context。
+func NewMCPClient(ctx context.Context, cfg config.MCPServerConfig) (*MCPClient, error) {
 	raw, err := newRawClient(cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	// 建立连接（stdio 在构造时已启动；SSE/HTTP 需显式 Start）。
-	ctx := context.Background()
 	if err := raw.Start(ctx); err != nil {
 		// stdio 的部分实现会在构造时自动 Start，此处失败一般可忽略；
 		// 但为稳妥，非 stdio 情况下的失败应上报。
@@ -142,8 +145,9 @@ func mapToEnvSlice(env map[string]string) []string {
 
 // DiscoverTools 向 Server 发起工具发现，按 include/exclude 过滤后，
 // 将每个工具适配为 agent.Tool（带 `<server>__` 前缀）返回。
-func (c *MCPClient) DiscoverTools() ([]agent.Tool, error) {
-	ctx := context.Background()
+//
+// ctx 用于控制请求超时与取消。
+func (c *MCPClient) DiscoverTools(ctx context.Context) ([]agent.Tool, error) {
 	res, err := c.raw.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("发现 MCP 工具失败：%w", err)
@@ -223,7 +227,14 @@ func (c *MCPClient) callTool(ctx context.Context, rawName string, arguments stri
 
 	res, err := c.raw.CallTool(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("调用 MCP 工具 %q 失败：%w", rawName, err)
+		// 工具调用失败时尝试重连一次（对 stdio 子进程崩溃场景尤为有效）。
+		if rerr := c.reconnect(ctx); rerr != nil {
+			return "", fmt.Errorf("调用 MCP 工具 %q 失败且重连失败：%w；重连错误：%w", rawName, err, rerr)
+		}
+		res, err = c.raw.CallTool(ctx, req)
+		if err != nil {
+			return "", fmt.Errorf("MCP 工具 %q 重连后调用仍失败：%w", rawName, err)
+		}
 	}
 
 	text := extractText(res)
@@ -231,6 +242,36 @@ func (c *MCPClient) callTool(ctx context.Context, rawName string, arguments stri
 		return text, fmt.Errorf("MCP 工具 %q 返回错误：%s", rawName, text)
 	}
 	return text, nil
+}
+
+// reconnect 关闭当前连接并重新建立（含 Start + Initialize），加锁防止并发重连。
+func (c *MCPClient) reconnect(ctx context.Context) error {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
+	_ = c.raw.Close()
+
+	raw, err := newRawClient(c.config)
+	if err != nil {
+		return fmt.Errorf("重建 MCP 客户端失败：%w", err)
+	}
+
+	if err := raw.Start(ctx); err != nil {
+		if c.config.Transport != "stdio" {
+			return fmt.Errorf("重启 MCP 客户端失败：%w", err)
+		}
+	}
+
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = clientInfo
+	if _, err := raw.Initialize(ctx, initReq); err != nil {
+		_ = raw.Close()
+		return fmt.Errorf("重新初始化 MCP 会话失败：%w", err)
+	}
+
+	c.raw = raw
+	return nil
 }
 
 // extractText 从 CallToolResult 中提取所有文本内容并拼接。

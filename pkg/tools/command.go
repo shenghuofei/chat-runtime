@@ -126,13 +126,17 @@ type commandArgs struct {
 
 // CommandTool 是安全的命令执行工具，实现 agent.Tool 接口。
 type CommandTool struct {
-	config            CommandToolConfig
+	config CommandToolConfig
+	// dangerousPatterns 保留原始列表，供外部（如测试）读取各模式。
 	dangerousPatterns []*regexp.Regexp
+	// combinedPattern 将所有危险模式合并为单个正则，匹配时只需一次调用。
+	combinedPattern *regexp.Regexp
 }
 
 // NewCommandTool 创建一个命令执行工具。
 //
-// 会将内置 DangerousPatterns 与配置中的 BlockedPatterns 合并作为最终的危险模式集合。
+// 会将内置 DangerousPatterns 与配置中的 BlockedPatterns 合并作为最终的危险模式集合，
+// 并预编译为单个合并正则（(?:pat1)|(?:pat2)|...），使 IsDangerous 只需一次匹配。
 func NewCommandTool(cfg CommandToolConfig) *CommandTool {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultCommandTimeout
@@ -140,7 +144,19 @@ func NewCommandTool(cfg CommandToolConfig) *CommandTool {
 	patterns := make([]*regexp.Regexp, 0, len(DangerousPatterns)+len(cfg.BlockedPatterns))
 	patterns = append(patterns, DangerousPatterns...)
 	patterns = append(patterns, cfg.BlockedPatterns...)
-	return &CommandTool{config: cfg, dangerousPatterns: patterns}
+
+	// 构建合并正则：将各模式用 (?:...) 包裹后以 | 连接。
+	parts := make([]string, len(patterns))
+	for i, re := range patterns {
+		parts[i] = "(?:" + re.String() + ")"
+	}
+	combined := regexp.MustCompile(strings.Join(parts, "|"))
+
+	return &CommandTool{
+		config:            cfg,
+		dangerousPatterns: patterns,
+		combinedPattern:   combined,
+	}
 }
 
 // Name 返回工具名称。
@@ -175,11 +191,24 @@ func (t *CommandTool) Schema() provider.ToolDef {
 	}
 }
 
-// NeedApproval 返回该工具是否需要审批。
+// NeedApproval 返回该工具是否可能需要审批。
 //
-// 命令工具作为高危能力，默认统一要求审批（返回 true）。更精细的“仅危险命令
-// 需审批”判定，请使用 IsDangerous 在调用点动态决策。
+// CommandTool 标记为”可能需要审批”（true），使其进入 approvalTool 装饰流程。
+// 实际上只有危险命令才会触发审批弹窗——approvalTool 会调用 NeedApprovalFor
+// 按参数动态判断，安全命令（ls、pwd 等）不会打扰用户。
 func (t *CommandTool) NeedApproval() bool { return true }
+
+// NeedApprovalFor 根据实际调用参数判断是否需要审批。
+//
+// 实现 agent.ArgumentAwareApproval 接口：只有 IsDangerous 判定为危险的命令
+// 才触发审批请求，普通只读命令直接放行。参数解析失败时保守地返回 true。
+func (t *CommandTool) NeedApprovalFor(arguments string) bool {
+	args, err := t.parseArgs(arguments)
+	if err != nil {
+		return true // 无法解析时保守处理，要求审批
+	}
+	return t.IsDangerous(fullCommandLine(args))
+}
 
 // parseArgs 解析并基础校验模型给出的参数。
 func (t *CommandTool) parseArgs(arguments string) (commandArgs, error) {
@@ -195,8 +224,13 @@ func (t *CommandTool) parseArgs(arguments string) (commandArgs, error) {
 
 // fullCommandLine 将 command 与 args 拼接为完整命令行字符串（仅用于模式匹配与展示）。
 func fullCommandLine(args commandArgs) string {
-	parts := append([]string{args.Command}, args.Args...)
-	return strings.Join(parts, " ")
+	var b strings.Builder
+	b.WriteString(args.Command)
+	for _, a := range args.Args {
+		b.WriteByte(' ')
+		b.WriteString(a)
+	}
+	return b.String()
 }
 
 // baseName 提取命令的基础名（去除路径），用于白名单匹配。
@@ -222,13 +256,10 @@ func (t *CommandTool) IsAllowed(command string) bool {
 }
 
 // IsDangerous 判断完整命令行是否命中任一危险模式。
+//
+// 使用预编译的合并正则进行单次匹配，性能优于逐条遍历。
 func (t *CommandTool) IsDangerous(commandLine string) bool {
-	for _, re := range t.dangerousPatterns {
-		if re.MatchString(commandLine) {
-			return true
-		}
-	}
-	return false
+	return t.combinedPattern.MatchString(commandLine)
 }
 
 // Execute 执行命令。
@@ -267,19 +298,49 @@ func (t *CommandTool) Execute(ctx context.Context, arguments string) (string, er
 		cmd.Dir = t.config.WorkDir
 	}
 
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	const maxOutputBytes = 1 * 1024 * 1024 // 1 MB
+	lw := &limitedWriter{limit: maxOutputBytes}
+	cmd.Stdout = lw
+	cmd.Stderr = lw
 
 	runErr := cmd.Run()
 
+	output := lw.buf.String()
+	if lw.truncated {
+		output += fmt.Sprintf("\n[输出已截断，超过 %d 字节上限]", maxOutputBytes)
+	}
+
 	// 超时判定优先。
 	if execCtx.Err() == context.DeadlineExceeded {
-		return buf.String(), fmt.Errorf("命令执行超时（%s）", t.config.Timeout)
+		return output, fmt.Errorf("命令执行超时（%s）", t.config.Timeout)
 	}
 	if runErr != nil {
 		// 非零退出：把已捕获的输出一并返回，便于模型理解失败原因。
-		return buf.String(), fmt.Errorf("命令执行失败：%w", runErr)
+		return output, fmt.Errorf("命令执行失败：%w", runErr)
 	}
-	return buf.String(), nil
+	return output, nil
+}
+
+// limitedWriter 是一个包装 bytes.Buffer 的写入器，超过 limit 字节后停止写入
+// 并标记 truncated，防止命令产生海量输出耗尽内存。
+type limitedWriter struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (lw *limitedWriter) Write(p []byte) (int, error) {
+	if lw.truncated {
+		return len(p), nil // 已截断，丢弃后续数据
+	}
+	remaining := lw.limit - lw.buf.Len()
+	if remaining <= 0 {
+		lw.truncated = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		lw.truncated = true
+		p = p[:remaining]
+	}
+	return lw.buf.Write(p)
 }

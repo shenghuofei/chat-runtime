@@ -9,6 +9,7 @@ package store
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -33,17 +34,18 @@ type SessionData struct {
 // Store 定义会话持久化的抽象接口。
 //
 // 上层（Session）只依赖该接口，具体实现可以是文件系统、数据库等。
+// 所有方法均接收 context.Context 作为第一参数，以便实现方支持超时与取消。
 type Store interface {
 	// Save 保存（覆盖）指定会话的快照。
-	Save(sessionID string, data SessionData) error
+	Save(ctx context.Context, sessionID string, data SessionData) error
 	// Load 加载指定会话的快照；不存在时返回错误。
-	Load(sessionID string) (*SessionData, error)
+	Load(ctx context.Context, sessionID string) (*SessionData, error)
 	// AppendMessage 向指定会话的增量日志追加一条消息。
-	AppendMessage(sessionID string, msg provider.Message) error
+	AppendMessage(ctx context.Context, sessionID string, msg provider.Message) error
 	// LoadLog 读取指定会话的增量日志；不存在时返回空切片且不报错。
-	LoadLog(sessionID string) ([]provider.Message, error)
+	LoadLog(ctx context.Context, sessionID string) ([]provider.Message, error)
 	// Delete 删除指定会话的快照与增量日志（幂等）。
-	Delete(sessionID string) error
+	Delete(ctx context.Context, sessionID string) error
 }
 
 // FileStore 是基于本地文件系统的 Store 实现。
@@ -51,9 +53,13 @@ type Store interface {
 // 每个会话对应两个文件：
 //   - <baseDir>/<id>.json  —— checkpoint 快照；
 //   - <baseDir>/<id>.jsonl —— 增量日志（每行一条 JSON）。
+//
+// 使用 sync.Map 按会话 ID 维护独立的 *sync.Mutex，避免所有会话共用单把全局锁，
+// 消除多会话并发时的不必要争用。
 type FileStore struct {
-	mu      sync.Mutex
 	baseDir string
+	// sessions 存储 sessionID -> *sync.Mutex 的映射，保证每个会话独立加锁。
+	sessions sync.Map
 }
 
 // 编译期断言：FileStore 实现了 Store 接口。
@@ -70,6 +76,12 @@ func NewFileStore(baseDir string) (*FileStore, error) {
 	return &FileStore{baseDir: baseDir}, nil
 }
 
+// sessionLock 返回指定会话 ID 对应的锁（不存在则新建），保证并发安全。
+func (s *FileStore) sessionLock(sessionID string) *sync.Mutex {
+	mu, _ := s.sessions.LoadOrStore(sessionID, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
 // checkpointPath 返回会话快照文件路径。
 func (s *FileStore) checkpointPath(sessionID string) string {
 	return filepath.Join(s.baseDir, sessionID+".json")
@@ -81,9 +93,10 @@ func (s *FileStore) logPath(sessionID string) string {
 }
 
 // Save 将会话快照原子性地写入磁盘（先写临时文件再 rename）。
-func (s *FileStore) Save(sessionID string, data SessionData) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *FileStore) Save(_ context.Context, sessionID string, data SessionData) error {
+	mu := s.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	buf, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
@@ -98,13 +111,18 @@ func (s *FileStore) Save(sessionID string, data SessionData) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("提交快照失败：%w", err)
 	}
+
+	// 快照写入成功：截断增量日志，以新快照为恢复基准，避免重复追加旧消息。
+	// 截断失败不影响快照完整性，仅在下次 Save 时重试。
+	_ = os.Truncate(s.logPath(sessionID), 0)
 	return nil
 }
 
 // Load 读取会话快照；文件不存在时返回错误。
-func (s *FileStore) Load(sessionID string) (*SessionData, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *FileStore) Load(_ context.Context, sessionID string) (*SessionData, error) {
+	mu := s.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	buf, err := os.ReadFile(s.checkpointPath(sessionID))
 	if err != nil {
@@ -121,9 +139,10 @@ func (s *FileStore) Load(sessionID string) (*SessionData, error) {
 }
 
 // AppendMessage 以追加方式向增量日志写入一条消息（每行一条 JSON）。
-func (s *FileStore) AppendMessage(sessionID string, msg provider.Message) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *FileStore) AppendMessage(_ context.Context, sessionID string, msg provider.Message) error {
+	mu := s.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	f, err := os.OpenFile(s.logPath(sessionID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -142,9 +161,10 @@ func (s *FileStore) AppendMessage(sessionID string, msg provider.Message) error 
 }
 
 // LoadLog 逐行读取增量日志并还原为消息列表；文件不存在时返回空切片。
-func (s *FileStore) LoadLog(sessionID string) ([]provider.Message, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *FileStore) LoadLog(_ context.Context, sessionID string) ([]provider.Message, error) {
+	mu := s.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	f, err := os.Open(s.logPath(sessionID))
 	if err != nil {
@@ -177,14 +197,20 @@ func (s *FileStore) LoadLog(sessionID string) ([]provider.Message, error) {
 }
 
 // Delete 删除会话的快照与增量日志。对不存在的文件保持幂等（不报错）。
-func (s *FileStore) Delete(sessionID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// 删除成功后同时清理 sync.Map 中的锁条目，避免长期运行的服务因大量短命会话
+// 造成锁表内存泄漏。
+func (s *FileStore) Delete(_ context.Context, sessionID string) error {
+	mu := s.sessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	for _, path := range []string{s.checkpointPath(sessionID), s.logPath(sessionID)} {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("删除文件 %q 失败：%w", path, err)
 		}
 	}
+
+	// 文件已删，后续不会再有并发访问，安全地移除锁条目。
+	s.sessions.Delete(sessionID)
 	return nil
 }

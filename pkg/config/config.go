@@ -18,6 +18,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -161,6 +162,21 @@ type ServerConfig struct {
 	Port int `yaml:"port"`
 	// BasicAuth HTTP Basic Auth 配置。
 	BasicAuth BasicAuthConfig `yaml:"basic_auth"`
+
+	// WebSocket 与审批超时配置（均有默认值，通常无需手动设置）。
+
+	// ApprovalTimeout Web 审批等待超时，默认 5m。
+	ApprovalTimeout time.Duration `yaml:"approval_timeout"`
+	// ShutdownTimeout 优雅关闭的最大等待时间，默认 15s。
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+	// ReadHeaderTimeout HTTP 读取请求头的超时，默认 10s。
+	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
+	// PingInterval WebSocket 心跳发送间隔，默认 30s。
+	PingInterval time.Duration `yaml:"ping_interval"`
+	// PongWait 等待 pong 响应的超时（应大于 PingInterval），默认 45s。
+	PongWait time.Duration `yaml:"pong_wait"`
+	// WriteWait WebSocket 写操作超时，默认 10s。
+	WriteWait time.Duration `yaml:"write_wait"`
 }
 
 // BasicAuthConfig HTTP Basic Auth 配置。
@@ -347,6 +363,24 @@ func (c *Config) applyDefaults() {
 	if c.Server.Port == 0 {
 		c.Server.Port = 8080
 	}
+	if c.Server.ApprovalTimeout == 0 {
+		c.Server.ApprovalTimeout = 5 * time.Minute
+	}
+	if c.Server.ShutdownTimeout == 0 {
+		c.Server.ShutdownTimeout = 15 * time.Second
+	}
+	if c.Server.ReadHeaderTimeout == 0 {
+		c.Server.ReadHeaderTimeout = 10 * time.Second
+	}
+	if c.Server.PingInterval == 0 {
+		c.Server.PingInterval = 30 * time.Second
+	}
+	if c.Server.PongWait == 0 {
+		c.Server.PongWait = 45 * time.Second
+	}
+	if c.Server.WriteWait == 0 {
+		c.Server.WriteWait = 10 * time.Second
+	}
 }
 
 // Validate 对配置进行基本的引用一致性校验。
@@ -402,11 +436,12 @@ func (c *Config) Chat(name string) (ChatConfig, error) {
 	return ch, nil
 }
 
-// ChatNames 返回所有已定义的对话名称。
+// ChatNames 返回所有已定义的对话名称（按字母顺序排列，保证响应顺序稳定）。
 func (c *Config) ChatNames() []string {
 	names := make([]string, 0, len(c.Chats))
 	for name := range c.Chats {
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
 }

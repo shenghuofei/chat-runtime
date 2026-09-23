@@ -240,7 +240,7 @@ func (m *Manager) keepLastRoundsLocked(n int) {
 		return
 	}
 	start := starts[len(starts)-n]
-	m.messages = append([]provider.Message(nil), m.messages[start:]...)
+	m.messages = m.messages[start:]
 }
 
 // truncateByRoundsLocked truncate 模式：超过 MaxRounds 时丢弃最早轮次。
@@ -276,7 +276,7 @@ func (m *Manager) compressByRoundsLocked() {
 	summary, err := m.config.Summarizer(early)
 	if err != nil {
 		// 摘要失败则退化为直接截断，保证上下文体积可控。
-		m.messages = append([]provider.Message(nil), m.messages[keepFrom:]...)
+		m.messages = m.messages[keepFrom:]
 		return
 	}
 

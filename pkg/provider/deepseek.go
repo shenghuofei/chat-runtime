@@ -55,7 +55,7 @@ func NewDeepSeekProvider(cfg ProviderConfig) (Provider, error) {
 		baseURL:      baseURL,
 		apiKey:       cfg.APIKey,
 		extraHeaders: cfg.ExtraHeaders,
-		httpClient:   &http.Client{Timeout: requestTimeout},
+		httpClient:   newHTTPClient(),
 	}, nil
 }
 
@@ -177,7 +177,7 @@ func (p *deepSeekProvider) doWithRetry(ctx context.Context, payload []byte) (*ht
 			return resp, nil
 		}
 
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		_ = resp.Body.Close()
 
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {

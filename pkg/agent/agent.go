@@ -96,6 +96,8 @@ type Tool interface {
 type AgentConfig struct {
 	// MaxIterations Tool Calling 循环的最大迭代次数，防止无限循环。<=0 时使用默认值。
 	MaxIterations int
+	// OnMessageAdded 每条消息写入 manager 后触发，用于增量持久化。可为 nil。
+	OnMessageAdded func(msg provider.Message)
 }
 
 // defaultMaxIterations 是 Tool Calling 循环的默认上限。
@@ -117,6 +119,16 @@ type Agent struct {
 	tools map[string]Tool
 	// approval 审批处理器（可为 nil，表示不进行审批装饰）。
 	approval ApprovalHandler
+
+	// toolsMu 保护 tools 注册与 toolDefsCache 的并发访问。
+	// 工具注册（RegisterTool）在 Run 之前完成，运行期只有读操作，
+	// 但使用读写锁保证 race detector 也不会报错。
+	toolsMu sync.RWMutex
+	// toolDefsCache 工具定义列表的缓存，RegisterTool 时失效。
+	// 工具列表在会话生命周期内几乎不变，无需每次 LLM 调用都重建。
+	toolDefsCache []provider.ToolDef
+	// toolDefsDirty 标记缓存是否需要重建。
+	toolDefsDirty bool
 }
 
 // New 创建一个 Agent。
@@ -125,10 +137,11 @@ func New(p provider.Provider, mgr *manager.Manager, cfg AgentConfig) *Agent {
 		cfg.MaxIterations = defaultMaxIterations
 	}
 	return &Agent{
-		provider: p,
-		manager:  mgr,
-		config:   cfg,
-		tools:    make(map[string]Tool),
+		provider:      p,
+		manager:       mgr,
+		config:        cfg,
+		tools:         make(map[string]Tool),
+		toolDefsDirty: true,
 	}
 }
 
@@ -142,11 +155,16 @@ func (a *Agent) RegisterTool(t Tool) {
 	if t == nil {
 		return
 	}
+	a.toolsMu.Lock()
 	a.tools[t.Name()] = t
+	a.toolDefsDirty = true // 使缓存失效
+	a.toolsMu.Unlock()
 }
 
 // ToolNames 返回已注册工具的名称列表（已排序，保证 Prompt Cache 前缀稳定）。
 func (a *Agent) ToolNames() []string {
+	a.toolsMu.RLock()
+	defer a.toolsMu.RUnlock()
 	names := make([]string, 0, len(a.tools))
 	for name := range a.tools {
 		names = append(names, name)
@@ -171,11 +189,37 @@ func (a *Agent) Clear() {
 }
 
 // toolDefs 返回按名称排序的工具定义列表（稳定顺序有利于 Prompt Cache 命中）。
+//
+// 结果会被缓存：工具列表在会话生命周期内几乎不变，只有 RegisterTool 后才重建，
+// 避免每次 LLM 调用都分配新切片并重排序。读写锁保证并发安全。
 func (a *Agent) toolDefs() []provider.ToolDef {
-	defs := make([]provider.ToolDef, 0, len(a.tools))
-	for _, name := range a.ToolNames() {
+	// 快速路径：缓存有效时只需读锁。
+	a.toolsMu.RLock()
+	if !a.toolDefsDirty && a.toolDefsCache != nil {
+		defs := a.toolDefsCache
+		a.toolsMu.RUnlock()
+		return defs
+	}
+	a.toolsMu.RUnlock()
+
+	// 缓存失效：升级为写锁并重建。
+	a.toolsMu.Lock()
+	defer a.toolsMu.Unlock()
+	// 二次检查：另一个 goroutine 可能已经重建。
+	if !a.toolDefsDirty && a.toolDefsCache != nil {
+		return a.toolDefsCache
+	}
+	names := make([]string, 0, len(a.tools))
+	for name := range a.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	defs := make([]provider.ToolDef, 0, len(names))
+	for _, name := range names {
 		defs = append(defs, a.tools[name].Schema())
 	}
+	a.toolDefsCache = defs
+	a.toolDefsDirty = false
 	return defs
 }
 
@@ -183,7 +227,9 @@ func (a *Agent) toolDefs() []provider.ToolDef {
 //
 // 注意：WrapWithApproval 内部已判断 NeedApproval()，不需要审批的工具会直接返回原始实例。
 func (a *Agent) resolveTool(name string) (Tool, bool) {
+	a.toolsMu.RLock()
 	t, ok := a.tools[name]
+	a.toolsMu.RUnlock()
 	if !ok {
 		return nil, false
 	}
@@ -195,6 +241,8 @@ func (a *Agent) resolveTool(name string) (Tool, bool) {
 
 // ToolCount 返回已注册工具数量。
 func (a *Agent) ToolCount() int {
+	a.toolsMu.RLock()
+	defer a.toolsMu.RUnlock()
 	return len(a.tools)
 }
 
@@ -209,6 +257,9 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 
 	// 追加用户输入。
 	a.manager.AddUserMessage(provider.Message{Content: input})
+	if a.config.OnMessageAdded != nil {
+		a.config.OnMessageAdded(provider.Message{Role: provider.RoleUser, Content: input})
+	}
 
 	var total Usage
 
@@ -257,10 +308,15 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 		content := contentBuf.String()
 
 		// 记录本轮 assistant 消息（可能携带 tool_calls）。
-		a.manager.AddAssistantMessage(provider.Message{
+		assistantMsg := provider.Message{
 			Content:   content,
 			ToolCalls: toolCalls,
-		})
+		}
+		a.manager.AddAssistantMessage(assistantMsg)
+		if a.config.OnMessageAdded != nil {
+			assistantMsg.Role = provider.RoleAssistant
+			a.config.OnMessageAdded(assistantMsg)
+		}
 
 		// 无工具调用：本轮结束。
 		if len(toolCalls) == 0 {
@@ -284,6 +340,18 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 			wg.Add(1)
 			go func(idx int, call provider.ToolCall) {
 				defer wg.Done()
+				// 捕获任何 panic，避免单个工具的崩溃导致 wg.Wait 永久阻塞。
+				defer func() {
+					if r := recover(); r != nil {
+						errMsg := fmt.Sprintf("工具 %q 执行时发生 panic: %v", call.Name, r)
+						emit(Event{Type: EventError, Content: errMsg})
+						results[idx] = toolResult{
+							callID: call.ID,
+							name:   call.Name,
+							result: errMsg,
+						}
+					}
+				}()
 				res := a.execToolCall(ctx, call, emit)
 				results[idx] = toolResult{callID: call.ID, name: call.Name, result: res}
 			}(i, tc)
@@ -293,6 +361,14 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 		// 按原始顺序回填结果（保持 Prompt Cache 稳定性）。
 		for _, tr := range results {
 			a.manager.AddToolResult(tr.callID, tr.name, tr.result)
+			if a.config.OnMessageAdded != nil {
+				a.config.OnMessageAdded(provider.Message{
+					Role:       provider.RoleTool,
+					ToolCallID: tr.callID,
+					Name:       tr.name,
+					Content:    tr.result,
+				})
+			}
 		}
 		// 继续下一轮循环，让模型基于工具结果继续生成。
 	}

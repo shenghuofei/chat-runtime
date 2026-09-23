@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/shenghuofei/chat-runtime/cmd"
@@ -16,10 +18,20 @@ import (
 	"github.com/shenghuofei/chat-runtime/pkg/tools"
 )
 
+// globalProviderCache 跨会话共享的 Provider 实例缓存，避免重复创建 HTTP 连接池。
+// key 格式："{type}:{model}:{baseURL}:{apiKey}"
+var (
+	globalProviderCache   = make(map[string]provider.Provider)
+	globalProviderCacheMu sync.Mutex
+)
+
 var (
 	Version   = "dev"
 	BuildTime = "unknown"
 )
+
+// mcpInitTimeout 是单个 MCP Server 初始化（连接 + 握手 + 工具发现）的超时上限。
+const mcpInitTimeout = 30 * time.Second
 
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
@@ -29,6 +41,15 @@ func main() {
 		fmt.Printf("Platform: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 		return
 	}
+
+	// 进程退出时统一关闭所有缓存的 Provider，释放 HTTP 连接。
+	defer func() {
+		globalProviderCacheMu.Lock()
+		defer globalProviderCacheMu.Unlock()
+		for _, p := range globalProviderCache {
+			_ = p.Close()
+		}
+	}()
 
 	// 注入 Agent 工厂：把 config → provider → manager → agent 的装配逻辑串起来。
 	cmd.SetAgentFactory(buildAgent)
@@ -61,18 +82,32 @@ func buildAgent(cfg *config.Config, chatName string) (*agent.Agent, func() error
 		return nil, nil, fmt.Errorf("模型 %q 引用了不存在的 provider %q", chatCfg.Model, modelCfg.Provider)
 	}
 
-	// 3. 创建 Provider 工厂函数
+	// 3. 创建 Provider 工厂函数（带缓存：相同配置的 Provider 只创建一次，共享 HTTP 连接池）
+	cacheKey := fmt.Sprintf("%s:%s:%s:%s", providerCfg.Type, modelCfg.Model, providerCfg.BaseURL, providerCfg.APIKey)
 	providerFactory := func(cc config.ChatConfig) (provider.Provider, error) {
-		return provider.New(provider.ProviderConfig{
+		globalProviderCacheMu.Lock()
+		defer globalProviderCacheMu.Unlock()
+		if p, ok := globalProviderCache[cacheKey]; ok {
+			return p, nil
+		}
+		p, err := provider.New(provider.ProviderConfig{
 			Type:    providerCfg.Type,
 			APIKey:  providerCfg.APIKey,
 			BaseURL: providerCfg.BaseURL,
 			Model:   modelCfg.Model,
 		})
+		if err != nil {
+			return nil, err
+		}
+		globalProviderCache[cacheKey] = p
+		return p, nil
 	}
 
 	// 4. 创建 Store（持久化）
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil, fmt.Errorf("获取用户主目录失败: %w", err)
+	}
 	storeDir := filepath.Join(homeDir, ".chat-runtime", "sessions")
 	fileStore, err := store.NewFileStore(storeDir)
 	if err != nil {
@@ -87,6 +122,32 @@ func buildAgent(cfg *config.Config, chatName string) (*agent.Agent, func() error
 	}
 
 	// 6. 注册内置工具
+	registerBuiltinTools(cfg, session.Agent)
+
+	// 7. 连接 MCP Server，发现并注册远程工具
+	mcpClients := connectMCPServers(cfg, chatCfg, session.Agent)
+
+	// 8. 构建清理函数
+	cleanup := func() error {
+		// 持久化会话历史
+		if err := session.Persist(); err != nil {
+			fmt.Fprintf(os.Stderr, "[警告] 持久化会话失败: %v\n", err)
+		}
+		// 关闭 MCP 客户端
+		for _, c := range mcpClients {
+			if err := c.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "[警告] 关闭 MCP 客户端失败: %v\n", err)
+			}
+		}
+		// Provider 已缓存，不在此处关闭；main() 退出时统一清理。
+		return nil
+	}
+
+	return session.Agent, cleanup, nil
+}
+
+// registerBuiltinTools 将配置中启用的内置工具注册到 Agent。
+func registerBuiltinTools(cfg *config.Config, ag *agent.Agent) {
 	if cfg.Tools.Command.Enabled {
 		var timeout time.Duration
 		if cfg.Tools.Command.Timeout != "" {
@@ -98,50 +159,56 @@ func buildAgent(cfg *config.Config, chatName string) (*agent.Agent, func() error
 			AllowedCommands: cfg.Tools.Command.Whitelist,
 			Timeout:         timeout,
 		})
-		session.Agent.RegisterTool(cmdTool)
+		ag.RegisterTool(cmdTool)
 	}
+}
 
-	// 7. 连接 MCP Server，发现并注册远程工具
+// connectMCPServers 按配置连接所有 MCP Server，发现工具后注册到 Agent。
+// 每个 Server 独立使用带超时的 context，单个失败不影响其他 Server。
+// 返回已成功建立连接的客户端列表（供 cleanup 关闭）。
+func connectMCPServers(cfg *config.Config, chatCfg config.ChatConfig, ag *agent.Agent) []*mcp.MCPClient {
 	var mcpClients []*mcp.MCPClient
+
 	for name, mcpCfg := range cfg.MCPServers {
 		// 如果对话配置了 mcp_servers 白名单，只连接指定的
 		if len(chatCfg.MCPServers) > 0 && !contains(chatCfg.MCPServers, name) {
 			continue
 		}
 
-		client, err := mcp.NewMCPClient(mcpCfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[警告] 连接 MCP Server %q 失败: %v（跳过）\n", name, err)
-			continue
-		}
-		mcpClients = append(mcpClients, client)
+		// 每个 MCP Server 使用独立的带超时 context，防止单个卡顿阻塞全部
+		ctx, cancel := context.WithTimeout(context.Background(), mcpInitTimeout)
+		client, mcpTools, err := initMCPServer(ctx, name, mcpCfg)
+		cancel()
 
-		mcpTools, err := client.DiscoverTools()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[警告] 从 MCP Server %q 发现工具失败: %v（跳过）\n", name, err)
+			fmt.Fprintf(os.Stderr, "[警告] MCP Server %q 初始化失败: %v（跳过）\n", name, err)
 			continue
 		}
+
+		mcpClients = append(mcpClients, client)
 		for _, t := range mcpTools {
-			session.Agent.RegisterTool(t)
+			ag.RegisterTool(t)
 		}
 		fmt.Fprintf(os.Stderr, "[MCP] 已连接 %s，注册了 %d 个工具\n", name, len(mcpTools))
 	}
 
-	// 8. 构建清理函数
-	cleanup := func() error {
-		// 先持久化会话
-		if err := session.Persist(); err != nil {
-			fmt.Fprintf(os.Stderr, "[警告] 持久化会话失败: %v\n", err)
-		}
-		// 关闭 MCP 客户端
-		for _, c := range mcpClients {
-			c.Close()
-		}
-		// 关闭 Session（含 Provider）
-		return session.Close()
+	return mcpClients
+}
+
+// initMCPServer 连接单个 MCP Server 并发现其工具。ctx 用于控制超时。
+func initMCPServer(ctx context.Context, name string, mcpCfg config.MCPServerConfig) (*mcp.MCPClient, []agent.Tool, error) {
+	client, err := mcp.NewMCPClient(ctx, mcpCfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("连接失败: %w", err)
 	}
 
-	return session.Agent, cleanup, nil
+	mcpTools, err := client.DiscoverTools(ctx)
+	if err != nil {
+		client.Close()
+		return nil, nil, fmt.Errorf("工具发现失败: %w", err)
+	}
+
+	return client, mcpTools, nil
 }
 
 // contains 检查字符串切片是否包含目标值。

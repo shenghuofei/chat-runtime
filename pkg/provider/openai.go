@@ -7,24 +7,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"strings"
-	"time"
 )
 
-// 默认配置常量。
+// openai.go 专属常量（maxRetries / baseRetryDelay / requestTimeout 已移至 helpers.go）。
 const (
 	// defaultOpenAIBaseURL OpenAI 官方 API 的默认基础地址。
 	defaultOpenAIBaseURL = "https://api.openai.com/v1"
 	// defaultModel 未在配置中指定模型时使用的兜底模型名。
 	defaultModel = "gpt-3.5-turbo"
-	// maxRetries 针对可重试错误（网络错误 / 5xx）的最大重试次数。
-	maxRetries = 3
-	// baseRetryDelay 指数退避的基础延迟。
-	baseRetryDelay = 500 * time.Millisecond
-	// requestTimeout 单次 HTTP 请求的整体超时时间。
-	requestTimeout = 5 * time.Minute
 )
 
 // openAIProvider 是基于 OpenAI Chat Completions API 的供应商实现。
@@ -73,9 +65,7 @@ func NewOpenAIProvider(cfg ProviderConfig) (Provider, error) {
 		baseURL:      baseURL,
 		apiKey:       cfg.APIKey,
 		extraHeaders: cfg.ExtraHeaders,
-		httpClient: &http.Client{
-			Timeout: requestTimeout,
-		},
+		httpClient:   newHTTPClient(),
 	}, nil
 }
 
@@ -226,13 +216,10 @@ func (p *openAIProvider) doWithRetry(ctx context.Context, payload []byte) (*http
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		// 每次重试前根据尝试次数进行指数退避（首次不等待）。
+		// 首次不等待；重试前使用 helpers.go 中的统一指数退避逻辑。
 		if attempt > 0 {
-			delay := time.Duration(float64(baseRetryDelay) * math.Pow(2, float64(attempt-1)))
-			select {
-			case <-ctx.Done():
+			if !retrySleep(ctx, attempt) {
 				return nil, ctx.Err()
-			case <-time.After(delay):
 			}
 		}
 
@@ -258,8 +245,8 @@ func (p *openAIProvider) doWithRetry(ctx context.Context, payload []byte) (*http
 			return resp, nil
 		}
 
-		// 读取错误响应体用于诊断。
-		body, _ := io.ReadAll(resp.Body)
+		// 读取错误响应体用于诊断（readErrorBody 内部处理读取失败）。
+		body := readErrorBody(resp)
 		_ = resp.Body.Close()
 		apiErr := parseAPIError(body)
 

@@ -53,7 +53,7 @@ func NewGeminiProvider(cfg ProviderConfig) (Provider, error) {
 		baseURL:      baseURL,
 		apiKey:       cfg.APIKey,
 		extraHeaders: cfg.ExtraHeaders,
-		httpClient:   &http.Client{Timeout: requestTimeout},
+		httpClient:   newHTTPClient(),
 	}, nil
 }
 
@@ -226,20 +226,32 @@ func (p *geminiProvider) convertMessages(messages []Message) (*geminiContent, []
 			}
 
 		case RoleTool:
-			// 工具结果转为 functionResponse（属于 user 角色的 turn）
+			// 工具结果转为 functionResponse（属于 user 角色的 turn）。
+			// Gemini API 要求：同一轮的多个工具结果必须合并到同一个 user 消息的多个
+			// parts 中，而不是各自独立为一条 user 消息，否则 API 会报格式错误。
 			var respData map[string]any
 			if err := json.Unmarshal([]byte(m.Content), &respData); err != nil {
 				respData = map[string]any{"result": m.Content}
 			}
-			contents = append(contents, geminiContent{
-				Role: "user",
-				Parts: []geminiPart{{
-					FunctionResponse: &geminiFuncResponse{
-						Name:     m.Name,
-						Response: respData,
-					},
-				}},
-			})
+			part := geminiPart{
+				FunctionResponse: &geminiFuncResponse{
+					Name:     m.Name,
+					Response: respData,
+				},
+			}
+			// 若上一条内容已是工具结果组（user 角色且首个 part 为 FunctionResponse），
+			// 则追加到同一消息；否则新建一条 user 消息。
+			if len(contents) > 0 &&
+				contents[len(contents)-1].Role == "user" &&
+				len(contents[len(contents)-1].Parts) > 0 &&
+				contents[len(contents)-1].Parts[0].FunctionResponse != nil {
+				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, part)
+			} else {
+				contents = append(contents, geminiContent{
+					Role:  "user",
+					Parts: []geminiPart{part},
+				})
+			}
 		}
 	}
 
@@ -299,7 +311,7 @@ func (p *geminiProvider) doWithRetry(ctx context.Context, payload []byte) (*http
 			return resp, nil
 		}
 
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		_ = resp.Body.Close()
 
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {

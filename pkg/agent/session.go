@@ -2,7 +2,10 @@ package agent
 
 import (
 	"container/list"
+	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,22 +70,45 @@ func NewSession(
 	if chatConfig.ContextManager != nil {
 		mgrCfg = *chatConfig.ContextManager
 	}
+	// compress 模式：注入 Summarizer，将早期消息通过 LLM 压缩为摘要。
+	if mgrCfg.Mode == manager.ModeCompress && mgrCfg.Summarizer == nil {
+		mgrCfg.Summarizer = buildSummarizer(p)
+	}
 	mgr := manager.New(mgrCfg)
 	mgr.SetSystemPrompt(chatConfig.System)
 
-	// 3. 尝试从 Store 恢复历史。
+	// 3. 尝试从 Store 恢复历史（合并 checkpoint 快照 + 增量日志）。
+	//
+	// 正常关闭流程：checkpoint 包含完整历史，log 为空（Save 后截断）；
+	// 崩溃场景：checkpoint 是最后一次 Save 的快照，log 包含此后的增量消息，
+	// 两者合并可还原完整历史。
 	if st != nil {
-		if data, err := st.Load(id); err == nil && data != nil {
-			mgr.Load(data.Messages)
+		var msgs []provider.Message
+		if data, err := st.Load(context.Background(), id); err == nil && data != nil {
+			msgs = data.Messages
 			if data.SystemPrompt != "" {
 				mgr.SetSystemPrompt(data.SystemPrompt)
 			}
 		}
-		// Load 失败通常意味着会话不存在，属于正常的新建场景，忽略错误。
+		if logMsgs, err := st.LoadLog(context.Background(), id); err == nil && len(logMsgs) > 0 {
+			msgs = append(msgs, logMsgs...)
+		}
+		if len(msgs) > 0 {
+			if verr := manager.ValidateRound(msgs); verr != nil {
+				fmt.Fprintf(os.Stderr, "[警告] 会话 %q 历史消息不完整，已尽力恢复: %v\n", id, verr)
+			}
+			mgr.Load(msgs)
+		}
 	}
 
-	// 4. 组装 Agent。
-	ag := New(p, mgr, AgentConfig{MaxIterations: chatConfig.MaxIterations})
+	// 4. 组装 Agent，注入增量持久化回调。
+	agCfg := AgentConfig{MaxIterations: chatConfig.MaxIterations}
+	if st != nil {
+		agCfg.OnMessageAdded = func(msg provider.Message) {
+			_ = st.AppendMessage(context.Background(), id, msg)
+		}
+	}
+	ag := New(p, mgr, agCfg)
 
 	now := time.Now()
 	return &Session{
@@ -111,7 +137,7 @@ func (s *Session) Persist() error {
 		Messages: s.manager.Raw(),
 		Metadata: map[string]any{"chat": s.ChatName},
 	}
-	return s.Store.Save(s.ID, data)
+	return s.Store.Save(context.Background(), s.ID, data)
 }
 
 // Close 释放会话资源：持久化历史并关闭 Provider 连接。
@@ -201,7 +227,9 @@ func (sm *SessionManager) GetOrCreate(id, chatName string) (*Session, error) {
 
 	// 在锁外执行可能较慢的 Close（持久化 + 网络关闭），避免阻塞其他请求。
 	for _, s := range evicted {
-		_ = s.Close()
+		if err := s.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "[警告] 淘汰会话 %q 时出错: %v\n", s.ID, err)
+		}
 	}
 
 	return sess, nil
@@ -249,7 +277,40 @@ func (sm *SessionManager) CloseAll() {
 	sm.mu.Unlock()
 
 	for _, elem := range elems {
-		_ = elem.Value.(*Session).Close()
+		s := elem.Value.(*Session)
+		if err := s.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "[警告] 关闭会话 %q 时出错: %v\n", s.ID, err)
+		}
+	}
+}
+
+// buildSummarizer 构造 compress 模式所需的摘要器，使用给定 Provider 将早期消息压缩为摘要文本。
+func buildSummarizer(p provider.Provider) manager.Summarizer {
+	return func(msgs []provider.Message) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		var prompt strings.Builder
+		prompt.WriteString("请将以下对话历史浓缩为简短摘要，保留关键信息和结论：\n\n")
+		for _, m := range msgs {
+			prompt.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, m.Content))
+		}
+
+		stream, err := p.Chat(ctx, []provider.Message{
+			{Role: provider.RoleUser, Content: prompt.String()},
+		}, nil)
+		if err != nil {
+			return "", fmt.Errorf("摘要请求失败: %w", err)
+		}
+
+		var result strings.Builder
+		for resp := range stream {
+			if resp.Err != nil {
+				return "", fmt.Errorf("摘要流式响应错误: %w", resp.Err)
+			}
+			result.WriteString(resp.Delta.Content)
+		}
+		return result.String(), nil
 	}
 }
 

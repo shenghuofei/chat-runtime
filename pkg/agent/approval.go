@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -49,6 +50,9 @@ func (h *CLIApprovalHandler) RequestApproval(ctx context.Context, toolName strin
 	fmt.Fprintf(h.out, "\n⚠️  工具调用需要审批\n  工具：%s\n  参数：%s\n是否允许执行？[y/N]: ", toolName, arguments)
 
 	// 在独立 goroutine 中读取，以便同时响应 ctx 取消。
+	// 注意：当 ctx 被取消后，goroutine 仍会阻塞在 ReadString 上，直到用户
+	// 在终端输入一行或标准输入被关闭后才能退出。由于 channel 缓冲为 1，
+	// goroutine 最终能写入并正常退出，不会永久泄漏。
 	type result struct {
 		line string
 		err  error
@@ -96,6 +100,8 @@ type WSApprovalHandler struct {
 	send ApprovalSender
 	// timeout 等待前端响应的超时（<=0 表示不超时，仅受 ctx 约束）。
 	timeout time.Duration
+	// logger 用于记录晚到/无效的审批响应，nil 时退化为 log.Default()。
+	logger *log.Logger
 
 	mu      sync.Mutex
 	pending map[string]chan bool
@@ -108,6 +114,7 @@ func NewWSApprovalHandler(send ApprovalSender, timeout time.Duration) *WSApprova
 	return &WSApprovalHandler{
 		send:    send,
 		timeout: timeout,
+		logger:  log.Default(),
 		pending: make(map[string]chan bool),
 	}
 }
@@ -154,19 +161,34 @@ func (h *WSApprovalHandler) RequestApproval(ctx context.Context, toolName string
 
 // Resolve 由 Transport 层在收到前端审批响应时调用，唤醒对应的等待。
 //
-// 若该 id 不存在（已超时/已清理），则静默忽略。
+// 若该 id 不存在（已超时/已清理），记录日志并忽略。
+// 若 channel 已满（极罕见：重复 Resolve），同样记录后忽略。
 func (h *WSApprovalHandler) Resolve(id string, approved bool) {
 	h.mu.Lock()
 	ch, ok := h.pending[id]
 	h.mu.Unlock()
 	if !ok {
+		// 超时后收到的晚到响应，记录以便排查审批流程问题。
+		h.logger.Printf("[审批] 收到未知或已超时的审批 ID %q 的响应（已忽略）", id)
 		return
 	}
 	// 非阻塞写入（channel 缓冲为 1）。
 	select {
 	case ch <- approved:
 	default:
+		// channel 已满说明被重复 Resolve，记录异常。
+		h.logger.Printf("[审批] 审批 ID %q 收到重复响应（已忽略）", id)
 	}
+}
+
+// ArgumentAwareApproval 是工具可选实现的接口，允许工具根据实际调用参数
+// 动态决定是否需要审批，而非统一返回固定值。
+//
+// 用途：CommandTool 的危险性取决于具体命令（ls 安全，rm -rf 危险），
+// 实现此接口后，approvalTool 会在执行前先问工具是否真的需要审批，
+// 只有危险命令才弹出审批提示，避免对所有命令都打扰用户。
+type ArgumentAwareApproval interface {
+	NeedApprovalFor(arguments string) bool
 }
 
 // approvalTool 是对 Tool 的装饰器：在执行前插入审批检查。
@@ -178,7 +200,7 @@ type approvalTool struct {
 }
 
 // WrapWithApproval 返回一个包装后的工具：若原工具需要审批，则在执行前先请求审批，
-// 被拒绝时直接返回“用户拒绝”结果而不真正执行。
+// 被拒绝时直接返回”用户拒绝”结果而不真正执行。
 //
 // 若原工具不需要审批（NeedApproval() 为 false），则直接返回原工具，避免额外开销。
 func WrapWithApproval(tool Tool, handler ApprovalHandler) Tool {
@@ -201,7 +223,18 @@ func (t *approvalTool) Schema() provider.ToolDef { return t.inner.Schema() }
 func (t *approvalTool) NeedApproval() bool { return true }
 
 // Execute 先请求审批，批准后再执行内部工具；被拒绝或审批出错时返回相应结果。
+//
+// 若内部工具实现了 ArgumentAwareApproval，则会先询问它是否真正需要审批：
+// 这样像 CommandTool 这类工具可以对安全命令（ls、pwd）直接放行，
+// 只对危险命令（rm -rf、sudo）触发审批提示，减少不必要的打扰。
 func (t *approvalTool) Execute(ctx context.Context, arguments string) (string, error) {
+	// 若工具支持按参数动态决策，则先询问；无需审批时直接执行。
+	if aa, ok := t.inner.(ArgumentAwareApproval); ok {
+		if !aa.NeedApprovalFor(arguments) {
+			return t.inner.Execute(ctx, arguments)
+		}
+	}
+
 	approved, err := t.handler.RequestApproval(ctx, t.inner.Name(), arguments)
 	if err != nil {
 		return "", fmt.Errorf("审批失败：%w", err)

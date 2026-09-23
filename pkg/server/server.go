@@ -19,14 +19,15 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/shenghuofei/chat-runtime/pkg/agent"
 	"github.com/shenghuofei/chat-runtime/pkg/config"
 	"github.com/shenghuofei/chat-runtime/pkg/web"
-	"github.com/gorilla/mux"
-	"github.com/gorilla/websocket"
 )
 
 // AgentFactory 根据配置与对话名创建一个已注册工具的 Agent，并返回释放资源的清理函数。
@@ -35,20 +36,8 @@ import (
 // 同时方便在测试中注入 mock 实现。
 type AgentFactory func(cfg *config.Config, chatName string) (ag *agent.Agent, cleanup func() error, err error)
 
-// approvalTimeout 是 Web 端审批等待的默认超时。
-const approvalTimeout = 5 * time.Minute
-
-// shutdownTimeout 是优雅关闭的最大等待时间。
-const shutdownTimeout = 15 * time.Second
-
-// pingInterval 是 WebSocket 心跳发送间隔。
-const pingInterval = 30 * time.Second
-
-// pongWait 是等待 pong 响应的超时时间（应大于 pingInterval）。
-const pongWait = 45 * time.Second
-
-// writeWait 是 WebSocket 写操作的超时。
-const writeWait = 10 * time.Second
+// Server 级别的超时均从 cfg.Server 读取，在 config.applyDefaults 中已填入合理默认值。
+// 这里保留常量仅作文档说明，不再被实际代码引用。
 
 // newID 生成一个随机的十六进制标识（用于会话 ID）。
 func newID() string {
@@ -105,6 +94,13 @@ type Server struct {
 	// sessions 活跃会话表，key 为会话 ID。
 	sessions   map[string]*Session
 	sessionsMu sync.RWMutex
+
+	// stats 服务运行统计。
+	stats struct {
+		totalRequests atomic.Int64
+		totalTokens   atomic.Int64
+		startTime     time.Time
+	}
 }
 
 // NewServer 根据配置与 Agent 工厂创建一个 Server。
@@ -122,6 +118,7 @@ func NewServer(cfg *config.Config, factory AgentFactory) *Server {
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
+	s.stats.startTime = time.Now()
 	s.routes()
 	return s
 }
@@ -140,6 +137,8 @@ func (s *Server) routes() {
 	s.router.HandleFunc("/ws", s.handleWebSocket)
 	// 列出可用对话预设。
 	s.router.HandleFunc("/api/chats", s.handleListChats).Methods(http.MethodGet)
+	// 服务运行统计。
+	s.router.HandleFunc("/api/stats", s.handleStats).Methods(http.MethodGet)
 	// 静态资源（内嵌的前端），置于最后作为兜底路由。
 	s.router.PathPrefix("/").Handler(web.FileServer())
 }
@@ -157,7 +156,7 @@ func (s *Server) Start(addr string) error {
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           s.router,
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: s.cfg.Server.ReadHeaderTimeout,
 	}
 
 	// 在独立 goroutine 中启动监听。
@@ -183,12 +182,13 @@ func (s *Server) Start(addr string) error {
 	}
 	signal.Stop(sigCh)
 
-	// 优雅关闭：给活跃请求最多 shutdownTimeout 时间完成。
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	// 优雅关闭：给活跃请求最多 ShutdownTimeout 时间完成。
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.Server.ShutdownTimeout)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		s.logger.Printf("HTTP 服务关闭超时: %v，强制退出", err)
+		s.logger.Printf("HTTP 服务关闭超时: %v，强制关闭", err)
+		_ = srv.Close()
 	}
 
 	// 关闭所有 WebSocket 会话（持久化 + 释放 Provider 资源）。
@@ -208,15 +208,20 @@ func (s *Server) closeAllSessions() {
 	s.sessionsMu.Unlock()
 
 	for _, sess := range sessions {
+		// 先取消正在进行的生成，再清理资源，避免 cleanup（持久化）与仍在运行的
+		// runChat goroutine 之间产生写入竞争。
+		sess.stop()
 		if sess.cleanup != nil {
-			_ = sess.cleanup()
+			if err := sess.cleanup(); err != nil {
+				s.logger.Printf("关闭会话 %s 失败: %v", sess.ID, err)
+			}
 		}
 	}
 }
 
 // handleListChats 返回配置中定义的所有对话预设名称。
 func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"chats": s.cfg.ChatNames(),
 	})
 }
@@ -243,6 +248,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	// 限制单条消息最大 8 MB，防止客户端发送超大消息耗尽内存。
+	conn.SetReadLimit(8 * 1024 * 1024)
 
 	// 为该连接创建会话，并绑定基于该连接的审批处理器。
 	sess := s.createSession(sessionID, chatName, conn)
@@ -255,9 +262,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.logger.Printf("WebSocket 已连接: session=%s chat=%s", sessionID, chatName)
 
 	// 设置 pong 处理器：收到 pong 时刷新读取超时。
-	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetReadDeadline(time.Now().Add(s.cfg.Server.PongWait))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetReadDeadline(time.Now().Add(s.cfg.Server.PongWait))
 		return nil
 	})
 
@@ -265,13 +272,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// 当主循环退出（连接关闭）时，pingDone channel 通知心跳停止。
 	pingDone := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(pingInterval)
+		ticker := time.NewTicker(s.cfg.Server.PingInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				sess.mu.Lock()
-				conn.SetWriteDeadline(time.Now().Add(writeWait))
+				conn.SetWriteDeadline(time.Now().Add(s.cfg.Server.WriteWait))
 				err := conn.WriteMessage(websocket.PingMessage, nil)
 				sess.mu.Unlock()
 				if err != nil {
@@ -295,7 +302,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 收到有效消息，刷新读取超时。
-		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetReadDeadline(time.Now().Add(s.cfg.Server.PongWait))
 		s.dispatch(conn, sess, msg)
 	}
 }
@@ -323,10 +330,17 @@ func (s *Server) dispatch(conn *websocket.Conn, sess *Session, msg ClientMessage
 
 // runChat 执行一轮对话生成，将事件流式推送回前端。
 func (s *Server) runChat(conn *websocket.Conn, sess *Session, content string) {
+	s.stats.totalRequests.Add(1)
+
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// 记录 cancel，供 stop 消息取消当前生成。
+	// 取消上一轮未完成的生成（若有），再登记新的 cancel。
+	// 防止用户快速连发两条 chat 消息时，两个 goroutine 同时跑 agent.Run
+	// 导致用户消息交错追加、历史乱序。
 	sess.mu.Lock()
+	if sess.cancel != nil {
+		sess.cancel()
+	}
 	sess.cancel = cancel
 	sess.mu.Unlock()
 	defer func() {
@@ -337,6 +351,9 @@ func (s *Server) runChat(conn *websocket.Conn, sess *Session, content string) {
 	}()
 
 	if err := sess.agent.Run(ctx, content, func(ev agent.Event) {
+		if ev.Type == agent.EventDone && ev.Usage != nil {
+			s.stats.totalTokens.Add(int64(ev.Usage.TotalTokens))
+		}
 		s.send(conn, sess, ev)
 	}); err != nil {
 		if ctx.Err() != nil {
@@ -352,25 +369,30 @@ func (s *Server) runChat(conn *websocket.Conn, sess *Session, content string) {
 func (s *Server) send(conn *websocket.Conn, sess *Session, ev agent.Event) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	conn.SetWriteDeadline(time.Now().Add(writeWait))
+	conn.SetWriteDeadline(time.Now().Add(s.cfg.Server.WriteWait))
 	if err := conn.WriteJSON(ev); err != nil {
 		s.logger.Printf("WebSocket 写入失败: %v", err)
 	}
 }
 
 // createSession 创建一个新会话并绑定审批处理器。
+//
+// 耗时的 Agent 初始化（连接 MCP、创建 HTTP 客户端等）在锁外进行，
+// 避免阻塞其他并发的 WebSocket 连接建立。
 func (s *Server) createSession(id, chatName string, conn *websocket.Conn) *Session {
+	// 1. 取出并移除同 ID 的旧会话（如有），在锁外执行 cleanup 避免持锁期间做网络操作。
 	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-
-	// 已存在同 ID 会话则先关闭旧的（同一会话重连）。
-	if old, ok := s.sessions[id]; ok {
-		if old.cleanup != nil {
-			_ = old.cleanup()
-		}
+	old, hadOld := s.sessions[id]
+	if hadOld {
 		delete(s.sessions, id)
 	}
+	s.sessionsMu.Unlock()
 
+	if hadOld && old.cleanup != nil {
+		_ = old.cleanup()
+	}
+
+	// 2. 锁外执行耗时的 Agent 创建（MCP 握手、HTTP 连接等）。
 	ag, cleanup, err := s.factory(s.cfg, chatName)
 	if err != nil {
 		s.logger.Printf("创建 Agent 失败: %v", err)
@@ -392,10 +414,22 @@ func (s *Server) createSession(id, chatName string, conn *websocket.Conn) *Sessi
 			ApprovalID: req.ID,
 		})
 		return nil
-	}, approvalTimeout)
+	}, s.cfg.Server.ApprovalTimeout)
 	ag.SetApprovalHandler(sess.approval)
 
+	// 3. 写回 sessions map（二次检查：极低概率下同一 ID 被并发创建，后者胜出）。
+	s.sessionsMu.Lock()
+	if existing, ok := s.sessions[id]; ok {
+		// 另一个 goroutine 已创建同 ID 会话，丢弃刚建好的，返回已有的。
+		s.sessionsMu.Unlock()
+		if cleanup != nil {
+			_ = cleanup()
+		}
+		return existing
+	}
 	s.sessions[id] = sess
+	s.sessionsMu.Unlock()
+
 	return sess
 }
 
@@ -408,8 +442,15 @@ func (s *Server) closeSession(id string) {
 	}
 	s.sessionsMu.Unlock()
 
-	if ok && sess.cleanup != nil {
-		_ = sess.cleanup()
+	if ok {
+		// 先取消正在进行的生成：WebSocket 断开后 runChat goroutine 若仍在等待 LLM
+		// 响应，不取消则它会一直运行到响应返回，无法被服务端优雅关闭感知。
+		sess.stop()
+		if sess.cleanup != nil {
+			if err := sess.cleanup(); err != nil {
+				s.logger.Printf("关闭会话 %s 时出错: %v", id, err)
+			}
+		}
 	}
 	s.logger.Printf("WebSocket 会话已关闭: session=%s", id)
 }
@@ -453,12 +494,29 @@ func secureCompare(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
+// handleStats 返回服务运行统计信息。
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"uptime_seconds":  time.Since(s.stats.startTime).Seconds(),
+		"total_requests":  s.stats.totalRequests.Load(),
+		"total_tokens":    s.stats.totalTokens.Load(),
+		"active_sessions": s.sessionCount(),
+	})
+}
+
+// sessionCount 返回当前活跃会话数量。
+func (s *Server) sessionCount() int {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	return len(s.sessions)
+}
+
 // writeJSON 以 JSON 形式写出响应。
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func (s *Server) writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		// 头部已写出，此处仅记录。
-		fmt.Println("writeJSON 编码失败:", err)
+		s.logger.Printf("writeJSON 编码失败: %v", err)
 	}
 }
