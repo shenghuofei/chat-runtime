@@ -24,12 +24,12 @@
 
 ```bash
 # 从源码构建
-git clone https://github.com/YOUR_USERNAME/chat-runtime.git
+git clone https://github.com/shenghuofei/chat-runtime.git
 cd chat-runtime
 make build
 
 # 或直接 go install
-go install github.com/YOUR_USERNAME/chat-runtime@latest
+go install github.com/shenghuofei/chat-runtime@latest
 ```
 
 ### 最小配置
