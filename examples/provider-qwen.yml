@@ -1,0 +1,30 @@
+# 通义千问 (Qwen) 配置模板
+# 适用于: qwen-plus / qwen-turbo / qwen-max / qwen-long 等
+# 文档: https://help.aliyun.com/zh/model-studio/developer-reference/use-qwen-by-calling-api
+#
+# 注意事项:
+#   - API Key 在阿里云百炼平台创建: https://bailian.console.aliyun.com/
+#   - 使用 OpenAI 兼容接口（DashScope compatible mode）
+#   - 支持 qwen-vl（视觉）等多模态模型
+
+providers:
+  qwen:
+    type: qwen
+    api_key: "${QWEN_API_KEY}"
+    # base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"   # 默认值
+
+models:
+  qwen-plus:
+    provider: qwen
+    model: qwen-plus
+    # temperature: 0.7
+
+  qwen-turbo:
+    provider: qwen
+    model: qwen-turbo
+
+chats:
+  default:
+    default: true
+    model: qwen-plus
+    system: "你是一个有用的助手，回答简洁准确。"

@@ -1,0 +1,39 @@
+# DeepSeek 配置模板
+# 适用于: deepseek-chat (V3) / deepseek-reasoner (R1) 等
+# 文档: https://api-docs.deepseek.com/
+#
+# 注意事项:
+#   - deepseek-reasoner 模型会输出思维链（reasoning_content），
+#     框架自动用 <think>...</think> 标签包裹
+#   - deepseek-reasoner 不支持 temperature/top_p 参数，框架自动跳过
+#   - 支持 Prompt Cache（自动统计 cache hit/miss tokens）
+
+providers:
+  deepseek:
+    type: deepseek
+    api_key: "${DEEPSEEK_API_KEY}"
+    # base_url: "https://api.deepseek.com"   # 默认值，可省略
+
+models:
+  # DeepSeek V3 - 通用对话
+  ds-chat:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.7
+
+  # DeepSeek R1 - 推理模型（带思维链）
+  ds-reasoner:
+    provider: deepseek
+    model: deepseek-reasoner
+    # 注意: reasoner 模型不支持 temperature/top_p，设了也会被忽略
+
+chats:
+  default:
+    default: true
+    model: ds-chat
+    system: "你是一个有用的助手，回答简洁准确。"
+
+  # 推理模式: 适合数学/逻辑/编程等复杂问题
+  reasoning:
+    model: ds-reasoner
+    system: "你是一个严谨的推理助手，请一步步分析问题。"

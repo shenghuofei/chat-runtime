@@ -1,0 +1,53 @@
+# chat-runtime 持续集成（CI）
+# 在推送到 main 分支或提交 Pull Request 时触发：测试、静态检查、构建。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 并发控制：同一分支的新提交会取消进行中的旧任务
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 测试与构建
+    runs-on: ubuntu-latest
+    steps:
+      # 拉取代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 安装 Go 环境（启用模块缓存）
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      # 下载依赖
+      - name: Download dependencies
+        run: go mod download
+
+      # 校验依赖清单是否整洁（go.mod / go.sum 未提交变更）
+      - name: Verify go.mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum || \
+            (echo "go.mod/go.sum 未整理，请运行 make tidy 后提交" && exit 1)
+
+      # 静态检查
+      - name: Lint (go vet)
+        run: go vet ./...
+
+      # 运行测试（含竞态检测）
+      - name: Test
+        run: go test ./... -v -race -coverprofile=coverage.out
+
+      # 构建二进制，确保可编译
+      - name: Build
+        run: go build -v ./...

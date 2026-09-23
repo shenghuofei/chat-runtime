@@ -1,0 +1,80 @@
+# chat-runtime 配置文件（所有参数及默认值）
+# 文档: docs/configuration.md
+
+# ---- LLM 提供商 ----
+providers:
+  ark:
+    type: ark
+    api_key: "${ARK_API_KEY}"
+    base_url: "https://ark.cn-beijing.volces.com/api/v3"
+
+# ---- 模型 ----
+models:
+  doubao:
+    provider: ark
+    model: "${ARK_MODEL}"
+    temperature: 0.7
+    max_tokens: 4096
+    top_p: 1.0
+
+# ---- 对话预设 ----
+chats:
+  default:
+    default: true
+    model: doubao
+    system: "你是一个有用的助手，回答简洁准确。"
+    max_iterations: 25
+    # tools: []              # 可用工具白名单，空表示全部可用
+    # mcp_servers: []        # 启用的 MCP Server 白名单，空表示全部启用
+    # context_manager:       # 覆盖全局上下文策略（可选）
+    #   mode: window
+    #   max_tokens: 128000
+
+# ---- MCP 工具服务器 ----
+mcp_servers: {}
+  # k8s-eye:
+  #   transport: stdio
+  #   command: ./k8s-eye
+  #   args: []
+  #   env:
+  #     KUBECONFIG: ~/.kube/config
+  #   auto_approve: true
+  #   include: []
+  #   exclude: []
+  #   no_concurrent: false
+  #   no_concurrent_tools: false
+  #
+  # web-search:
+  #   transport: sse
+  #   url: https://your-mcp-host/sse
+  #   headers: {}
+  #   auto_approve:
+  #     - search
+
+# ---- 内置工具 ----
+tools:
+  command:
+    enabled: false
+    whitelist: []              # 命令白名单，空表示不限制
+    auto_approve: false        # 是否自动批准（建议 false）
+    timeout: "30s"
+  filesystem:
+    enabled: false
+    root: "."                  # 限定根目录
+    readonly: true
+
+# ---- 上下文管理（全局默认，可被 chat 级别覆盖）----
+context_manager:
+  mode: ""                     # compress / truncate / window，空表示不裁剪
+  max_rounds: 50               # compress/truncate 模式的最大轮次
+  max_tokens: 128000           # window 模式的 token 预算
+  compress_ratio: 0.8          # window 模式触发比例
+
+# ---- Web 服务 ----
+server:
+  host: "0.0.0.0"
+  port: 8080
+  basic_auth:
+    enabled: false
+    username: "admin"
+    password: "changeme"

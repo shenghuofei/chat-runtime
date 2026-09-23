@@ -1,0 +1,74 @@
+# k8s-ops.yml —— Kubernetes 运维配置（结合 MCP k8s-eye）
+#
+# 演示如何把 chat-runtime 用作 K8s 运维助手：
+#   - 通过 MCP Server(k8s-eye, stdio) 提供集群查询/操作工具
+#   - 只读工具自动批准，写/删操作强制人工审批
+#   - 内置命令工具走 kubectl 白名单
+#
+# 运行：
+#   export OPENAI_API_KEY=sk-...
+#   ./chat-runtime --config examples/k8s-ops.yml
+#
+# 提示：k8s-eye 为示意用的 MCP Server 可执行文件，请替换为你的实际二进制路径。
+
+providers:
+  openai:
+    type: openai
+    api_key: ${OPENAI_API_KEY}
+
+models:
+  default:
+    provider: openai
+    model: gpt-4o
+    temperature: 0.2        # 运维场景偏确定性
+    max_tokens: 4096
+
+chats:
+  default:
+    model: default
+    system: |
+      你是一名 Kubernetes 运维专家（SRE）。
+      当前用户：{{.User}}，工作目录：{{.Cwd}}，日期：{{.Date}}。
+      原则：
+      1. 排查问题时先只读查看（get/describe/logs），确认现状后再提出变更。
+      2. 任何删除、驱逐、扩缩容等变更操作，必须先说明影响与回滚方案，再执行。
+      3. 输出的 kubectl 命令要精确到 namespace，避免误操作。
+    mcp_servers:
+      - k8s-eye
+    tools:
+      - command
+
+mcp_servers:
+  k8s-eye:
+    transport: stdio
+    command: ./k8s-eye
+    env:
+      KUBECONFIG: ${HOME}/.kube/config
+    # 只读工具自动批准；delete/drain/scale 等未列出的工具仍需人工审批
+    auto_approve:
+      - get_pods
+      - get_nodes
+      - describe_pod
+      - get_logs
+      - get_events
+    # 屏蔽最高危工具，避免模型直接调用
+    exclude:
+      - delete_namespace
+      - drain_node
+
+tools:
+  command:
+    enabled: true
+    # 只允许 kubectl 及少量只读命令
+    whitelist:
+      - kubectl
+      - kubens
+      - kubectx
+    # 只读 kubectl 由 MCP 工具承担；命令行工具默认需审批
+    auto_approve: false
+    timeout: 30s
+
+# 运维排查常涉及较长的日志/事件输出，用 window 精确控制上下文体积
+context_manager:
+  mode: window
+  max_tokens: 24000

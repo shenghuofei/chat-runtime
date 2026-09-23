@@ -1,0 +1,40 @@
+# ===== Go 标准忽略 =====
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试与覆盖率产物
+*.test
+*.out
+coverage.*
+
+# Go workspace
+go.work
+go.work.sum
+
+# 依赖目录（如使用 vendor）
+/vendor/
+
+# ===== 项目产物 =====
+# 交叉编译输出目录
+/dist/
+
+# 编译出的本地二进制
+/chat-runtime
+
+# ===== 配置与密钥 =====
+# 本地配置（可能含密钥），示例配置在 examples/ 下
+config.yml
+config.yaml
+
+# ===== 日志 =====
+*.log
+
+# ===== 编辑器 / 系统文件 =====
+.idea/
+.vscode/
+*.swp
+.DS_Store

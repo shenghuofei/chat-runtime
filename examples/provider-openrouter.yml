@@ -1,0 +1,38 @@
+# OpenRouter 配置模板
+# 适用于: 通过 OpenRouter 统一网关访问 200+ 模型
+# 文档: https://openrouter.ai/docs
+#
+# 注意事项:
+#   - 在 https://openrouter.ai/keys 创建 API Key
+#   - 模型名格式为 provider/model，如 openai/gpt-4o、anthropic/claude-3.5-sonnet
+#   - 支持所有主流模型，适合需要灵活切换模型的场景
+#   - 按用量计费，不需要每个 Provider 单独开通 API
+
+providers:
+  openrouter:
+    type: openrouter
+    api_key: "${OPENROUTER_API_KEY}"
+    # base_url: "https://openrouter.ai/api/v1"   # 默认值
+
+models:
+  gpt4o:
+    provider: openrouter
+    model: openai/gpt-4o
+
+  claude-sonnet:
+    provider: openrouter
+    model: anthropic/claude-sonnet-4
+
+  deepseek:
+    provider: openrouter
+    model: deepseek/deepseek-chat
+
+  llama:
+    provider: openrouter
+    model: meta-llama/llama-3.1-70b-instruct
+
+chats:
+  default:
+    default: true
+    model: gpt4o
+    system: "你是一个有用的助手，回答简洁准确。"

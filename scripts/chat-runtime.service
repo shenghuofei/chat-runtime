@@ -1,0 +1,66 @@
+# chat-runtime systemd 服务文件
+#
+# 安装:
+#   1. 将二进制放到 /usr/local/bin/chat-runtime
+#   2. 将配置文件放到 /etc/chat-runtime/config.yml
+#   3. 创建运行用户: useradd -r -s /sbin/nologin chat-runtime
+#   4. 复制本文件: cp scripts/chat-runtime.service /etc/systemd/system/
+#   5. 启用并启动:
+#        systemctl daemon-reload
+#        systemctl enable chat-runtime
+#        systemctl start chat-runtime
+#   6. 查看日志: journalctl -u chat-runtime -f
+
+[Unit]
+Description=chat-runtime - LLM Agent Runtime
+Documentation=https://github.com/YOUR_USERNAME/chat-runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chat-runtime
+Group=chat-runtime
+
+# 二进制与配置路径
+ExecStart=/usr/local/bin/chat-runtime serve \
+    --config /etc/chat-runtime/config.yml \
+    --host 0.0.0.0 \
+    --port 8080
+
+# 工作目录
+WorkingDirectory=/var/lib/chat-runtime
+
+# 优雅关闭：发 SIGTERM，等 30 秒后 SIGKILL
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 自动重启策略：异常退出时 5 秒后重启
+Restart=on-failure
+RestartSec=5
+
+# 环境变量（API Key 等敏感信息建议用 EnvironmentFile）
+# EnvironmentFile=/etc/chat-runtime/env
+# 示例 env 文件内容:
+#   ARK_API_KEY=your-key
+#   ARK_MODEL=ep-xxxxx
+
+# 资源限制
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/chat-runtime
+PrivateTmp=true
+
+# 日志输出到 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chat-runtime
+
+[Install]
+WantedBy=multi-user.target

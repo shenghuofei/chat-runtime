@@ -1,0 +1,33 @@
+# 火山引擎方舟（豆包）配置模板
+# 适用于: Doubao-pro / Doubao-lite / DeepSeek 托管版等
+# 文档: https://www.volcengine.com/docs/82379/1298454
+#
+# 注意事项:
+#   - model 字段填 Endpoint ID（如 ep-20241208120114-7csw8），不是模型名
+#   - 在火山方舟控制台创建推理接入点后获取 Endpoint ID
+#   - API Key 在控制台「API Key 管理」中创建
+#   - 支持豆包 thinking 模式（reasoning_content），框架自动用 <think> 标签包裹
+#
+# 获取 Endpoint ID 步骤:
+#   1. 登录 https://console.volcengine.com/ark
+#   2. 左侧「在线推理」→「推理接入点」
+#   3. 创建接入点，选择模型，获取 ep-xxxx 格式的 ID
+
+providers:
+  ark:
+    type: ark
+    api_key: "${ARK_API_KEY}"
+    # base_url: "https://ark.cn-beijing.volces.com/api/v3"   # 默认值，可省略
+
+models:
+  doubao:
+    provider: ark
+    model: "${ARK_MODEL}"   # Endpoint ID，如 ep-20241208120114-7csw8
+    # temperature: 0.7
+    # max_tokens: 4096
+
+chats:
+  default:
+    default: true
+    model: doubao
+    system: "你是一个有用的助手，回答简洁准确。"

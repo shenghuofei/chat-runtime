@@ -1,0 +1,32 @@
+# Google Gemini 配置模板
+# 适用于: gemini-2.0-flash / gemini-2.5-pro 等
+# 文档: https://ai.google.dev/api/generate-content
+#
+# 注意事项:
+#   - API Key 在 https://aistudio.google.com/apikey 创建
+#   - 鉴权通过 URL query 参数传递（框架自动处理）
+#   - Gemini 使用 systemInstruction 而非 system role（框架自动转换）
+#   - 工具调用格式为 functionCall/functionResponse（框架自动转换）
+
+providers:
+  gemini:
+    type: gemini
+    api_key: "${GEMINI_API_KEY}"
+    # base_url: "https://generativelanguage.googleapis.com"   # 默认值，可省略
+
+models:
+  flash:
+    provider: gemini
+    model: gemini-2.0-flash
+    # temperature: 0.7
+
+  pro:
+    provider: gemini
+    model: gemini-2.5-pro
+    # max_tokens: 8192
+
+chats:
+  default:
+    default: true
+    model: flash
+    system: "你是一个有用的助手，回答简洁准确。"

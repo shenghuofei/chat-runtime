@@ -1,0 +1,22 @@
+# minimal.yml —— 最小可用配置
+#
+# 运行：
+#   export DEEPSEEK_API_KEY=sk-your-key
+#   ./chat-runtime --config examples/minimal.yml
+#
+# 这是能跑起来的最小配置：一个 provider、一个 model、一个 chat。
+
+providers:
+  deepseek:
+    type: deepseek
+    api_key: ${DEEPSEEK_API_KEY}
+
+models:
+  default:
+    provider: deepseek
+    model: deepseek-chat
+
+chats:
+  default:
+    model: default
+    system: "你是一个有用的助手。"

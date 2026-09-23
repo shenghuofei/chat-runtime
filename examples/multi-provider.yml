@@ -1,0 +1,67 @@
+# multi-provider.yml —— 多 Provider 混合模型配置
+#
+# 演示同时接入多个 LLM 提供商，并在不同对话中使用不同模型：
+#   - 日常对话用性价比高的 DeepSeek
+#   - 复杂推理用 OpenAI GPT-4o
+#   - 本地/离线任务用 Ollama 本地模型
+#
+# 运行：
+#   export DEEPSEEK_API_KEY=sk-...
+#   export OPENAI_API_KEY=sk-...
+#   ./chat-runtime --config examples/multi-provider.yml
+
+providers:
+  deepseek:
+    type: deepseek
+    api_key: ${DEEPSEEK_API_KEY}
+
+  openai:
+    type: openai
+    api_key: ${OPENAI_API_KEY}
+
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434   # 本地 Ollama，无需 api_key
+
+models:
+  # 默认模型：便宜、够用
+  default:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.7
+    max_tokens: 4096
+
+  # 高智能模型：用于复杂推理/代码
+  smart:
+    provider: openai
+    model: gpt-4o
+    temperature: 0.3
+    max_tokens: 8192
+
+  # 本地模型：离线/隐私敏感场景
+  local:
+    provider: ollama
+    model: llama3.1
+
+chats:
+  # 日常助手（默认）
+  default:
+    model: default
+    system: "你是一个有用的助手，回答简洁准确。"
+
+  # 编程助手：用更强的模型
+  coder:
+    model: smart
+    system: |
+      你是一名资深软件工程师。
+      给出可运行的代码，附必要的中文注释，并说明关键设计取舍。
+
+  # 离线助手：走本地模型
+  offline:
+    model: local
+    system: "你是一个运行在本地的离线助手。"
+
+# 全局上下文策略：保留最近 20 轮
+context_manager:
+  mode: truncate
+  max_rounds: 20

@@ -1,0 +1,42 @@
+# chat-runtime 发布（Release）
+# 在推送形如 v* 的 tag 时触发：交叉编译所有平台并创建 GitHub Release。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 需要写入 Release 的权限
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取完整历史，便于 git describe 生成版本号
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      # 交叉编译所有平台并打包为 tar.gz（复用 Makefile 的 release 目标）
+      - name: Build release artifacts
+        run: make release VERSION=${{ github.ref_name }}
+
+      # 创建 GitHub Release 并上传产物
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # 自动根据 commit 生成发布说明
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
