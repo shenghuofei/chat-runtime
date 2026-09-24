@@ -291,6 +291,145 @@ func TestFactoryUnknownType(t *testing.T) {
 	}
 }
 
+// ---- convertMessages 与 convertTools 单元测试 ----
+
+// TestConvertMessagesBasic 验证各角色消息被正确映射为 chatMessage。
+func TestConvertMessagesBasic(t *testing.T) {
+	msgs := []Message{
+		{Role: RoleSystem, Content: "你是助手"},
+		{Role: RoleUser, Content: "你好"},
+		{Role: RoleAssistant, Content: "你好！"},
+		{Role: RoleTool, Content: "工具结果", ToolCallID: "call_1", Name: "run"},
+	}
+	out := convertMessages(msgs)
+	if len(out) != len(msgs) {
+		t.Fatalf("消息数量不一致：want=%d got=%d", len(msgs), len(out))
+	}
+	for i, m := range msgs {
+		if out[i].Role != string(m.Role) {
+			t.Errorf("[%d] Role: want=%q got=%q", i, m.Role, out[i].Role)
+		}
+		if out[i].Content != m.Content {
+			t.Errorf("[%d] Content: want=%q got=%q", i, m.Content, out[i].Content)
+		}
+	}
+	// tool 消息的 ToolCallID 与 Name 应原样保留。
+	if out[3].ToolCallID != "call_1" {
+		t.Errorf("ToolCallID: want=call_1 got=%q", out[3].ToolCallID)
+	}
+	if out[3].Name != "run" {
+		t.Errorf("Name: want=run got=%q", out[3].Name)
+	}
+}
+
+// TestConvertMessagesToolCalls 验证 assistant 消息中的 tool_calls 被正确展开。
+func TestConvertMessagesToolCalls(t *testing.T) {
+	msg := Message{
+		Role: RoleAssistant,
+		ToolCalls: []ToolCall{
+			{ID: "tc1", Name: "shell", Arguments: `{"cmd":"ls"}`},
+			{ID: "tc2", Name: "read", Arguments: `{"path":"/tmp"}`},
+		},
+	}
+	out := convertMessages([]Message{msg})
+	if len(out) != 1 {
+		t.Fatalf("消息数量不一致：want=1 got=%d", len(out))
+	}
+	cm := out[0]
+	if len(cm.ToolCalls) != 2 {
+		t.Fatalf("ToolCalls 数量不一致：want=2 got=%d", len(cm.ToolCalls))
+	}
+	// 验证第一个工具调用。
+	tc := cm.ToolCalls[0]
+	if tc.ID != "tc1" || tc.Function.Name != "shell" || tc.Function.Arguments != `{"cmd":"ls"}` {
+		t.Errorf("ToolCall[0] 不一致: %+v", tc)
+	}
+	// type 字段应为 "function"。
+	if tc.Type != "function" {
+		t.Errorf("ToolCall[0].Type: want=function got=%q", tc.Type)
+	}
+}
+
+// TestConvertToolsEmpty 验证空 tools 返回 nil（不发送空数组给 API）。
+func TestConvertToolsEmpty(t *testing.T) {
+	if got := convertTools(nil); got != nil {
+		t.Errorf("convertTools(nil) 期望返回 nil，实际 %v", got)
+	}
+	if got := convertTools([]ToolDef{}); got != nil {
+		t.Errorf("convertTools([]) 期望返回 nil，实际 %v", got)
+	}
+}
+
+// TestConvertToolsSchema 验证工具定义字段（名称、描述、参数 Schema）被完整保留。
+func TestConvertToolsSchema(t *testing.T) {
+	schema := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"city": map[string]interface{}{"type": "string"},
+		},
+	}
+	tools := []ToolDef{
+		{Name: "get_weather", Description: "查询天气", Parameters: schema},
+	}
+	out := convertTools(tools)
+	if len(out) != 1 {
+		t.Fatalf("工具数量不一致：want=1 got=%d", len(out))
+	}
+	ct := out[0]
+	if ct.Type != "function" {
+		t.Errorf("Type: want=function got=%q", ct.Type)
+	}
+	if ct.Function.Name != "get_weather" {
+		t.Errorf("Function.Name: want=get_weather got=%q", ct.Function.Name)
+	}
+	if ct.Function.Description != "查询天气" {
+		t.Errorf("Function.Description: want=查询天气 got=%q", ct.Function.Description)
+	}
+	if _, ok := ct.Function.Parameters["properties"]; !ok {
+		t.Error("Function.Parameters 缺少 properties 字段")
+	}
+}
+
+// TestIsReasoningModel 验证 OpenAI o 系列推理模型的名称匹配逻辑。
+func TestIsReasoningModel(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"o1-mini", true},
+		{"o1-preview", true},
+		{"o3-mini", true},
+		{"o4-mini", true},
+		{"gpt-4o", false},
+		{"gpt-3.5-turbo", false},
+		{"o1", true},
+		{"o3", true},
+	}
+	for _, c := range cases {
+		if got := isReasoningModel(c.model); got != c.want {
+			t.Errorf("isReasoningModel(%q): want=%v got=%v", c.model, c.want, got)
+		}
+	}
+}
+
+// TestIsReasonerModel 验证 DeepSeek 推理模型的名称匹配逻辑（含大小写）。
+func TestIsReasonerModel(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"deepseek-reasoner", true},
+		{"DeepSeek-Reasoner", true}, // 大小写不敏感
+		{"deepseek-chat", false},
+		{"deepseek-coder", false},
+	}
+	for _, c := range cases {
+		if got := isReasonerModel(c.model); got != c.want {
+			t.Errorf("isReasonerModel(%q): want=%v got=%v", c.model, c.want, got)
+		}
+	}
+}
+
 // TestOptionsSerialization 验证生成参数（温度等）被正确写入请求体。
 func TestOptionsSerialization(t *testing.T) {
 	bodyCh := make(chan string, 1)

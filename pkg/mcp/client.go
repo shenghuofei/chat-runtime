@@ -12,8 +12,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/shenghuofei/chat-runtime/pkg/agent"
 	"github.com/shenghuofei/chat-runtime/pkg/config"
@@ -51,6 +55,8 @@ type MCPClient struct {
 	noConcurrent bool
 	// reconnectMu 防止并发重连。
 	reconnectMu sync.Mutex
+	// closed 标记客户端已被关闭，防止 callTool 在 Close 后触发不必要的重连。
+	closed atomic.Bool
 }
 
 // NewMCPClient 依据配置创建并初始化一个 MCP 客户端。
@@ -62,6 +68,12 @@ type MCPClient struct {
 //
 // ctx 用于控制初始化超时与取消，调用方应传入带有合理 deadline 的 context。
 func NewMCPClient(ctx context.Context, cfg config.MCPServerConfig) (*MCPClient, error) {
+	// Server 名称不能包含工具名分隔符（双下划线），否则 "serverA__serverB__tool" 无法
+	// 唯一确定属于哪个 Server，导致工具名歧义。
+	if strings.Contains(cfg.Name, toolNameSeparator) {
+		return nil, fmt.Errorf("MCP Server 名称 %q 不能包含 %q，请使用不含双下划线的名称", cfg.Name, toolNameSeparator)
+	}
+
 	raw, err := newRawClient(cfg)
 	if err != nil {
 		return nil, err
@@ -165,7 +177,17 @@ func (c *MCPClient) DiscoverTools(ctx context.Context) ([]agent.Tool, error) {
 		if !c.shouldInclude(mt.Name) {
 			continue
 		}
-		tools = append(tools, c.newMCPTool(mt))
+		t := c.newMCPTool(mt)
+		if t == nil {
+			// 工具原始名含分隔符（__），无法唯一解析，跳过。
+			slog.Warn("跳过工具名含分隔符的 MCP 工具，可能引起歧义",
+				"server", c.config.Name,
+				"tool", mt.Name,
+				"separator", toolNameSeparator,
+			)
+			continue
+		}
+		tools = append(tools, t)
 	}
 	return tools, nil
 }
@@ -175,10 +197,10 @@ func (c *MCPClient) DiscoverTools(ctx context.Context) ([]agent.Tool, error) {
 // 优先级：先应用 include（若配置了白名单，则仅白名单内的工具通过），
 // 再应用 exclude（从中剔除黑名单工具）。
 func (c *MCPClient) shouldInclude(rawName string) bool {
-	if len(c.config.Include) > 0 && !contains(c.config.Include, rawName) {
+	if len(c.config.Include) > 0 && !slices.Contains(c.config.Include, rawName) {
 		return false
 	}
-	if contains(c.config.Exclude, rawName) {
+	if slices.Contains(c.config.Exclude, rawName) {
 		return false
 	}
 	return true
@@ -194,7 +216,7 @@ func (c *MCPClient) isAutoApproved(rawName string) bool {
 	if aa.All {
 		return true
 	}
-	return contains(aa.Tools, rawName)
+	return slices.Contains(aa.Tools, rawName)
 }
 
 // prefixedName 返回带 Server 前缀的工具名：`<server>__<tool>`。
@@ -219,6 +241,11 @@ func (c *MCPClient) lockFor(rawName string) *sync.Mutex {
 
 // callTool 调用一次远端工具并将结果内容拼为文本返回。
 func (c *MCPClient) callTool(ctx context.Context, rawName string, arguments string) (string, error) {
+	// 快速失败：客户端已关闭，不再尝试调用或重连。
+	if c.closed.Load() {
+		return "", fmt.Errorf("调用 MCP 工具 %q 失败：客户端已关闭", rawName)
+	}
+
 	// 解析参数（模型给出 JSON 字符串）。
 	var argMap map[string]any
 	if strings.TrimSpace(arguments) != "" {
@@ -237,6 +264,22 @@ func (c *MCPClient) callTool(ctx context.Context, rawName string, arguments stri
 	res, err := raw.CallTool(ctx, req)
 	if err != nil {
 		// 工具调用失败时尝试重连一次（对 stdio 子进程崩溃场景尤为有效）。
+		// 短暂退避后再重连，给 MCP Server 重启留出缓冲时间，
+		// 避免在服务端重启瞬间发起密集连接风暴。
+		// 使用 NewTimer+Stop 而非 time.After，确保 ctx 提前取消时定时器被释放，
+		// 不在后台泄漏 goroutine 直到 500ms 耗尽。
+		backoff := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			backoff.Stop()
+			return "", fmt.Errorf("调用 MCP 工具 %q 失败（上下文已取消）：%w", rawName, err)
+		case <-backoff.C:
+		}
+		backoff.Stop() // 若已触发本调用为空操作，保持安全
+		// Close 后不重连：若客户端已被关闭（如会话清理），直接返回错误。
+		if c.closed.Load() {
+			return "", fmt.Errorf("调用 MCP 工具 %q 失败（客户端已关闭）：%w", rawName, err)
+		}
 		// 传入当时读取的 raw，若已被其他 goroutine 重连替换则 reconnect 直接返回。
 		if rerr := c.reconnect(ctx, raw); rerr != nil {
 			return "", fmt.Errorf("调用 MCP 工具 %q 失败且重连失败：%w；重连错误：%w", rawName, err, rerr)
@@ -316,7 +359,11 @@ func extractText(res *mcp.CallToolResult) string {
 }
 
 // Close 关闭底层客户端连接（对 stdio 会终止子进程）。
+//
+// 先置位 closed 标记，再关闭底层连接，保证并发的 callTool 在连接关闭后
+// 不会再触发重连（reconnect 会看到 closed=true 并跳过重连）。
 func (c *MCPClient) Close() error {
+	c.closed.Store(true)
 	c.rawMu.RLock()
 	raw := c.raw
 	c.rawMu.RUnlock()
@@ -324,16 +371,6 @@ func (c *MCPClient) Close() error {
 		return nil
 	}
 	return raw.Close()
-}
-
-// contains 判断字符串是否在切片中。
-func contains(list []string, s string) bool {
-	for _, item := range list {
-		if item == s {
-			return true
-		}
-	}
-	return false
 }
 
 // MCPTool 将一个 MCP 工具适配为 agent.Tool 接口。
@@ -356,7 +393,13 @@ type MCPTool struct {
 var _ agent.Tool = (*MCPTool)(nil)
 
 // newMCPTool 由发现到的 mcp.Tool 构造一个 MCPTool。
+//
+// 若工具原始名包含分隔符（双下划线），则拼接后的工具名无法唯一解析属于哪个 Server，
+// 跳过并打印 Warn 日志，避免工具名歧义。
 func (c *MCPClient) newMCPTool(mt mcp.Tool) *MCPTool {
+	if strings.Contains(mt.Name, toolNameSeparator) {
+		return nil
+	}
 	return &MCPTool{
 		client:      c,
 		rawName:     mt.Name,

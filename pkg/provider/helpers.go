@@ -47,12 +47,18 @@ func newHTTPClient() *http.Client {
 }
 
 // retrySleep 在重试前按指数退避休眠，返回 false 表示 context 已取消。
+//
+// 使用 time.NewTimer 替代 time.After：time.After 返回的 channel 在计时器触发前
+// 无法被 GC 回收；若 ctx 先取消，泄漏的 timer 会在 delay 到期前一直占用资源。
+// NewTimer + defer Stop() 确保 ctx 取消后计时器立即释放。
 func retrySleep(ctx context.Context, attempt int) bool {
 	delay := time.Duration(float64(baseRetryDelay) * math.Pow(2, float64(attempt-1)))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(delay):
+	case <-timer.C:
 		return true
 	}
 }

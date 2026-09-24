@@ -380,7 +380,7 @@
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const chat = getChatName();
       const sid = getSessionId(chat); // 每次连接都从 localStorage 取当前 chat 的 sessionId
-      ws = new WebSocket(`${proto}://${location.host}/ws?session=${encodeURIComponent(sid)}&chat=${encodeURIComponent(chat)}`);
+      ws = new WebSocket(`${proto}://${location.host}/ws?resume_session_id=${encodeURIComponent(sid)}&chat=${encodeURIComponent(chat)}`);
       ws.onopen = () => { setStatus('online', '已连接'); reconnectDelay = 1000; };
       ws.onmessage = (e) => { try { handleServerMessage(JSON.parse(e.data)); } catch {} };
       ws.onclose = () => {
@@ -405,7 +405,13 @@
         case 'token':       appendToken(msg.content || ''); break;
         case 'tool_call':   renderToolCall(msg.name, msg.args, msg.call_id); break;
         case 'tool_result': renderToolResult(msg.name, msg.result, msg.call_id); break;
-        case 'approval':    renderApproval(msg.approval_id, msg.name, msg.args); break;
+        case 'approval':    renderApproval(msg.approval_id, msg.name, msg.content); break;
+        case 'session':
+          if (msg.session_id) {
+            const chatName = getChatName();
+            localStorage.setItem('cr_session_' + (chatName || 'default'), msg.session_id);
+          }
+          break;
         case 'done':        finishGenerating(msg.usage); break;
         case 'error':       renderError(msg.content || msg.message || '未知错误'); finishGenerating(); break;
       }

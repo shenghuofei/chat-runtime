@@ -190,7 +190,18 @@ providers:
 
 // TestEnvVarUndefined 验证未定义的环境变量被替换为空字符串。
 func TestEnvVarUndefined(t *testing.T) {
-	os.Unsetenv("DEFINITELY_NOT_SET_VAR_XYZ")
+	// 使用 t.Cleanup 确保无论测试结果如何，都能恢复原始环境变量状态，
+	// 避免影响并行测试或在 CI 环境中意外清除外部设置的变量。
+	const varName = "DEFINITELY_NOT_SET_VAR_XYZ"
+	orig, wasSet := os.LookupEnv(varName)
+	t.Cleanup(func() {
+		if wasSet {
+			os.Setenv(varName, orig)
+		} else {
+			os.Unsetenv(varName)
+		}
+	})
+	os.Unsetenv(varName)
 	dir := t.TempDir()
 	yml := `
 providers:

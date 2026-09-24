@@ -30,6 +30,9 @@ const (
 // 嵌入 baseProvider 复用 HTTP 与重试逻辑。
 type deepSeekProvider struct {
 	baseProvider
+	// isReasoner 是否为推理模型（不支持 temperature/top_p）。
+	// 由配置显式声明优先；未声明时根据模型名启发式判断。
+	isReasoner bool
 }
 
 // NewDeepSeekProvider 创建 DeepSeek 专用 Provider。
@@ -51,6 +54,8 @@ func NewDeepSeekProvider(cfg ProviderConfig) (Provider, error) {
 			extraHeaders: cfg.ExtraHeaders,
 			httpClient:   newHTTPClient(),
 		},
+		// 配置显式声明优先；未声明时根据模型名启发式判断（含 "reasoner" 子串）。
+		isReasoner: cfg.IsReasoner || isReasonerModel(model),
 	}, nil
 }
 
@@ -68,21 +73,11 @@ func NewDeepSeekProvider(cfg ProviderConfig) (Provider, error) {
 func (p *deepSeekProvider) Chat(ctx context.Context, messages []Message, tools []ToolDef, opts ...Option) (<-chan StreamResponse, error) {
 	o := applyOptions(opts...)
 
-	// DeepSeek 请求格式与 OpenAI 兼容，复用 convertMessages / convertTools
-	reqBody := chatRequest{
-		Model:       p.model,
-		Messages:    convertMessages(messages),
-		Tools:       convertTools(tools),
-		Stream:      true,
-		StreamOpts:  &streamOpts{IncludeUsage: true},
-		Temperature: o.Temperature,
-		MaxTokens:   o.MaxTokens,
-		TopP:        o.TopP,
-		Stop:        o.Stop,
-	}
+	// DeepSeek 请求格式与 OpenAI 兼容，复用公共构建器。
+	reqBody := buildOpenAICompatRequest(p.model, messages, tools, o)
 
-	// deepseek-reasoner 模型不支持 temperature/top_p
-	if isReasonerModel(p.model) {
+	// deepseek-reasoner 模型不支持 temperature/top_p。
+	if p.isReasoner {
 		reqBody.Temperature = nil
 		reqBody.TopP = nil
 	}

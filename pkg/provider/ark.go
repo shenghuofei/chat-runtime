@@ -30,6 +30,8 @@ const (
 // 嵌入 baseProvider 复用 HTTP 与重试逻辑。
 type arkProvider struct {
 	baseProvider
+	// isReasoner 是否为推理模型（豆包 thinking 模式，不支持 temperature/top_p）。
+	isReasoner bool
 }
 
 // NewArkProvider 创建火山引擎方舟专用 Provider。
@@ -51,6 +53,7 @@ func NewArkProvider(cfg ProviderConfig) (Provider, error) {
 			extraHeaders: cfg.ExtraHeaders,
 			httpClient:   newHTTPClient(),
 		},
+		isReasoner: cfg.IsReasoner,
 	}, nil
 }
 
@@ -64,16 +67,12 @@ func NewArkProvider(cfg ProviderConfig) (Provider, error) {
 func (p *arkProvider) Chat(ctx context.Context, messages []Message, tools []ToolDef, opts ...Option) (<-chan StreamResponse, error) {
 	o := applyOptions(opts...)
 
-	reqBody := chatRequest{
-		Model:       p.model,
-		Messages:    convertMessages(messages),
-		Tools:       convertTools(tools),
-		Stream:      true,
-		StreamOpts:  &streamOpts{IncludeUsage: true},
-		Temperature: o.Temperature,
-		MaxTokens:   o.MaxTokens,
-		TopP:        o.TopP,
-		Stop:        o.Stop,
+	// Ark 请求格式与 OpenAI 兼容，复用公共构建器。
+	reqBody := buildOpenAICompatRequest(p.model, messages, tools, o)
+	// 豆包 thinking（推理）模型不支持 temperature/top_p。
+	if p.isReasoner {
+		reqBody.Temperature = nil
+		reqBody.TopP = nil
 	}
 
 	payload, err := json.Marshal(reqBody)

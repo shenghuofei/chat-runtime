@@ -231,7 +231,7 @@ func (p *claudeProvider) convertMessages(messages []Message) []claudeMessage {
 
 		case RoleTool:
 			// Anthropic 要求同一轮的所有 tool_result 必须合并在同一个 user 消息中。
-			// 若上一条已是包含 tool_result 的 user 消息，则追加到其中；否则新建。
+			// 若上一条已是"全部为 tool_result 块"的 user 消息，则追加到其中；否则新建。
 			toolBlock := claudeContentBlock{
 				Type:      "tool_result",
 				ToolUseID: m.ToolCallID,
@@ -240,7 +240,7 @@ func (p *claudeProvider) convertMessages(messages []Message) []claudeMessage {
 			if n := len(result); n > 0 {
 				if last := result[n-1]; last.Role == "user" {
 					if blocks, ok := last.Content.([]claudeContentBlock); ok &&
-						len(blocks) > 0 && blocks[0].Type == "tool_result" {
+						allToolResultBlocks(blocks) {
 						result[n-1].Content = append(blocks, toolBlock)
 						continue
 					}
@@ -254,6 +254,21 @@ func (p *claudeProvider) convertMessages(messages []Message) []claudeMessage {
 	}
 
 	return result
+}
+
+// allToolResultBlocks 判断给定 content blocks 是否全部为 tool_result 类型。
+// 用于 convertMessages 中安全地将新 tool_result 合并到已有 user 消息，
+// 避免将 text block + tool_result 混合的 user 消息错误地追加 tool_result 块。
+func allToolResultBlocks(blocks []claudeContentBlock) bool {
+	if len(blocks) == 0 {
+		return false
+	}
+	for _, b := range blocks {
+		if b.Type != "tool_result" {
+			return false
+		}
+	}
+	return true
 }
 
 // convertTools 将统一工具定义转换为 Anthropic 格式

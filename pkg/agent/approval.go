@@ -3,7 +3,9 @@ package agent
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -68,6 +70,12 @@ func (h *CLIApprovalHandler) RequestApproval(ctx context.Context, toolName strin
 		return false, ctx.Err()
 	case r := <-ch:
 		if r.err != nil {
+			// EOF（Ctrl+D）视为用户拒绝，输出提示后返回 false 而非错误，
+			// 避免中断整个 Agent 循环——模型会收到"用户拒绝"的工具结果并自行决策。
+			if errors.Is(r.err, io.EOF) {
+				fmt.Fprintln(h.out, "\n[检测到 EOF，已自动拒绝工具执行]")
+				return false, nil
+			}
 			return false, fmt.Errorf("读取审批输入失败：%w", r.err)
 		}
 		answer := strings.ToLower(strings.TrimSpace(r.line))
@@ -122,9 +130,10 @@ func NewWSApprovalHandler(send ApprovalSender, timeout time.Duration) *WSApprova
 // RequestApproval 下发审批请求并阻塞等待结果，直到收到响应、超时或 ctx 取消。
 func (h *WSApprovalHandler) RequestApproval(ctx context.Context, toolName string, arguments string) (bool, error) {
 	// 生成唯一 ID 并登记等待 channel。
+	// 使用自增 seq 即可保证会话内唯一，无需额外拼接 UnixNano。
 	h.mu.Lock()
 	h.seq++
-	id := fmt.Sprintf("approval-%d-%d", time.Now().UnixNano(), h.seq)
+	id := fmt.Sprintf("approval-%d", h.seq)
 	ch := make(chan bool, 1)
 	h.pending[id] = ch
 	h.mu.Unlock()

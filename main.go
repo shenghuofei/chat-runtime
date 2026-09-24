@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/shenghuofei/chat-runtime/cmd"
@@ -25,10 +29,10 @@ import (
 )
 
 // globalProviderCache 跨会话共享的 Provider 实例缓存，避免重复创建 HTTP 连接池。
-// key 格式："{type}:{model}:{baseURL}:{apiKey}"
+// key 格式："{type}:{model}:{baseURL}:{apiKey_hash}:{headers_hash}"
 var (
 	globalProviderCache   = make(map[string]provider.Provider)
-	globalProviderCacheMu sync.Mutex
+	globalProviderCacheMu sync.RWMutex // RWMutex 允许并发读，避免多 goroutine 缓存命中时互相阻塞
 )
 
 // globalFileStore 跨会话共享的 FileStore 单例。
@@ -65,8 +69,9 @@ var (
 	BuildTime = "unknown"
 )
 
-// mcpInitTimeout 是单个 MCP Server 初始化（连接 + 握手 + 工具发现）的超时上限。
-const mcpInitTimeout = 30 * time.Second
+// mcpInitTimeoutDefault 是 MCP Server 初始化超时的硬编码兜底值，
+// 仅在 Config 尚未解析（极罕见路径）时使用；正常路径通过 cfg.MCPInitTimeout 配置。
+const mcpInitTimeoutDefault = 30 * time.Second
 
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
@@ -88,7 +93,27 @@ func main() {
 		globalProviderCacheMu.Lock()
 		defer globalProviderCacheMu.Unlock()
 		for _, p := range globalProviderCache {
-			_ = p.Close()
+			if err := p.Close(); err != nil {
+				slog.Warn("关闭 Provider 失败", "error", err)
+			}
+		}
+	}()
+
+	// 监听 SIGHUP 信号：收到后关闭并清空 Provider 缓存，下次请求将重建 Provider。
+	// 适用场景：API Key 轮换、BaseURL 变更后无需重启进程，发送 kill -HUP <pid> 即可热更新。
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGHUP)
+		for range ch {
+			slog.Info("收到 SIGHUP，清空 Provider 缓存以应用配置变更")
+			globalProviderCacheMu.Lock()
+			for k, p := range globalProviderCache {
+				if err := p.Close(); err != nil {
+					slog.Warn("SIGHUP: 关闭 Provider 失败", "key", k, "error", err)
+				}
+			}
+			globalProviderCache = make(map[string]provider.Provider)
+			globalProviderCacheMu.Unlock()
 		}
 	}()
 
@@ -103,14 +128,18 @@ func main() {
 
 // buildAgent 是 AgentFactory 的实现：根据配置和对话名创建一个完整的 Agent。
 //
+// sessionID 决策：
+//   - 空字符串：使用基于 chatName+homeDir 的稳定哈希 ID（CLI 模式，跨重启可恢复历史）；
+//   - 非空字符串：使用调用方提供的 ID（Web Resume 场景或测试场景）。
+//
 // 装配流程：
 //  1. 解析对话配置，找到关联的 model 和 provider
-//  2. 创建 LLM Provider 实例
+//  2. 创建 LLM Provider 实例（带双检锁缓存，不同配置可并发创建）
 //  3. 创建 Session（内含 Manager + Store + Agent）
 //  4. 注册内置工具（命令执行等）
 //  5. 连接 MCP Server，发现并注册远程工具
 //  6. 返回 Agent 和清理函数
-func buildAgent(cfg *config.Config, chatName string) (*agent.Agent, func() error, error) {
+func buildAgent(cfg *config.Config, chatName string, sessionID string) (*agent.Agent, func() error, error) {
 	// 1. 获取对话配置
 	chatCfg, err := cfg.Chat(chatName)
 	if err != nil {
@@ -134,20 +163,38 @@ func buildAgent(cfg *config.Config, chatName string) (*agent.Agent, func() error
 	headersHash := hashHeaders(providerCfg.ExtraHeaders)
 	cacheKey := fmt.Sprintf("%s:%s:%s:%s:%s", providerCfg.Type, modelCfg.Model, providerCfg.BaseURL, keyHash, headersHash)
 	providerFactory := func() (provider.Provider, error) {
-		globalProviderCacheMu.Lock()
-		defer globalProviderCacheMu.Unlock()
+		// 快速路径：读锁检查缓存（允许多 goroutine 并发命中）。
+		globalProviderCacheMu.RLock()
 		if p, ok := globalProviderCache[cacheKey]; ok {
+			globalProviderCacheMu.RUnlock()
 			return p, nil
 		}
+		globalProviderCacheMu.RUnlock()
+
+		// 慢速路径：锁外创建 Provider，避免持写锁期间执行 HTTP 初始化，
+		// 防止不同配置的 Provider 创建被串行化。
 		p, err := provider.New(provider.ProviderConfig{
 			Type:         providerCfg.Type,
 			APIKey:       providerCfg.APIKey,
 			BaseURL:      providerCfg.BaseURL,
 			Model:        modelCfg.Model,
 			ExtraHeaders: providerCfg.ExtraHeaders,
+			IsReasoner:   modelCfg.Reasoner,
 		})
 		if err != nil {
 			return nil, err
+		}
+
+		// 双检锁写回：并发场景下可能有多个 goroutine 同时走到这里，
+		// 后到者丢弃自己创建的实例，使用已缓存的那个。
+		globalProviderCacheMu.Lock()
+		defer globalProviderCacheMu.Unlock()
+		if existing, ok := globalProviderCache[cacheKey]; ok {
+			// 丢弃竞争中多创建的实例，关闭其连接池。
+			if err := p.Close(); err != nil {
+				slog.Warn("关闭竞争创建的 Provider 实例失败", "error", err)
+			}
+			return existing, nil
 		}
 		globalProviderCache[cacheKey] = p
 		return p, nil
@@ -159,12 +206,14 @@ func buildAgent(cfg *config.Config, chatName string) (*agent.Agent, func() error
 		return nil, nil, fmt.Errorf("创建 Store 失败: %w", err)
 	}
 
-	// 5. 创建 Session（会自动创建 Provider + Manager + Agent）
-	// 使用稳定的 Session ID（基于 chatName + 用户主目录的哈希），
-	// 使重启后能恢复到同一会话的历史。
+	// 5. 确定 Session ID 并创建 Session。
+	// - CLI 模式（sessionID=""）：使用基于 chatName+homeDir 的稳定哈希，跨重启可恢复历史；
+	// - Web Resume 模式（sessionID!=""）：使用调用方传入的 ID，加载对应历史。
 	// globalHomeDir 已由 getGlobalFileStore 的 sync.Once 写入，无需重复调用 syscall。
-	sessionID := stableSessionID(chatName, globalHomeDir)
-	session, err := agent.NewSession(sessionID, chatName, chatCfg, providerFactory, fileStore)
+	if sessionID == "" {
+		sessionID = stableSessionID(chatName, globalHomeDir)
+	}
+	session, err := agent.NewSession(context.Background(), sessionID, chatName, chatCfg, providerFactory, fileStore)
 	if err != nil {
 		return nil, nil, fmt.Errorf("创建 Session 失败: %w", err)
 	}
@@ -197,7 +246,9 @@ func buildAgent(cfg *config.Config, chatName string) (*agent.Agent, func() error
 		}
 		// 释放 Store 的写入器与 sync.Map 条目（保留磁盘文件）。
 		// Web 模式每连接随机 sessionID，不释放会导致句柄/内存泄漏。
-		fileStore.Release(context.Background(), sessionID)
+		if err := fileStore.Release(context.Background(), sessionID); err != nil {
+			slog.Warn("释放会话 Store 资源失败", "session", sessionID, "error", err)
+		}
 		// 关闭 MCP 客户端
 		for _, c := range mcpClients {
 			if err := c.Close(); err != nil {
@@ -220,10 +271,22 @@ func registerBuiltinTools(cfg *config.Config, ag *agent.Agent) {
 				timeout = d
 			}
 		}
+		// 编译自定义危险模式，跳过编译失败的条目并记录警告。
+		var blocked []*regexp.Regexp
+		for _, pat := range cfg.Tools.Command.BlockedPatterns {
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				slog.Warn("跳过无效的 blocked_pattern，正则编译失败", "pattern", pat, "error", err)
+				continue
+			}
+			blocked = append(blocked, re)
+		}
 		cmdTool := tools.NewCommandTool(tools.CommandToolConfig{
 			AllowedCommands: cfg.Tools.Command.Whitelist,
 			Timeout:         timeout,
 			AutoApprove:     cfg.Tools.Command.AutoApprove.All,
+			MaxOutputBytes:  cfg.Tools.Command.MaxOutputBytes,
+			BlockedPatterns: blocked,
 		})
 		ag.RegisterTool(cmdTool)
 	}
@@ -243,7 +306,7 @@ func connectMCPServers(cfg *config.Config, chatCfg config.ChatConfig, ag *agent.
 	}
 	var targets []target
 	for name, mcpCfg := range cfg.MCPServers {
-		if len(chatCfg.MCPServers) > 0 && !contains(chatCfg.MCPServers, name) {
+		if len(chatCfg.MCPServers) > 0 && !slices.Contains(chatCfg.MCPServers, name) {
 			continue
 		}
 		targets = append(targets, target{name, mcpCfg})
@@ -251,6 +314,9 @@ func connectMCPServers(cfg *config.Config, chatCfg config.ChatConfig, ag *agent.
 	if len(targets) == 0 {
 		return nil
 	}
+	// 按名称排序，保证 MCP Server 初始化顺序（及工具注册顺序）确定，
+	// 避免 map 遍历随机性导致工具列表每次顺序不同，影响 Prompt Cache 命中率。
+	sort.Slice(targets, func(i, j int) bool { return targets[i].name < targets[j].name })
 
 	// 并发初始化：每个 Server 一个 goroutine，结果通过有缓冲 channel 回收。
 	type result struct {
@@ -265,7 +331,15 @@ func connectMCPServers(cfg *config.Config, chatCfg config.ChatConfig, ag *agent.
 		wg.Add(1)
 		go func(name string, mcpCfg config.MCPServerConfig) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), mcpInitTimeout)
+			// 优先使用 Server 级别的 InitTimeout，回退到全局 MCPInitTimeout，再回退到默认值。
+			timeout := mcpCfg.InitTimeout
+			if timeout <= 0 {
+				timeout = cfg.MCPInitTimeout
+			}
+			if timeout <= 0 {
+				timeout = mcpInitTimeoutDefault
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			client, mcpTools, err := initMCPServer(ctx, name, mcpCfg)
 			if err != nil {
@@ -282,9 +356,23 @@ func connectMCPServers(cfg *config.Config, chatCfg config.ChatConfig, ag *agent.
 		close(resultCh)
 	}()
 
-	// 在主 goroutine 中顺序消费结果并注册工具（RegisterTool 非并发安全）。
-	var mcpClients []*mcp.MCPClient
+	// 收集全部结果，按 Server 名称排序后再注册工具。
+	// goroutine 完成顺序不确定，直接消费 resultCh 会导致工具注册顺序随机，
+	// 影响 Prompt Cache 命中率（工具列表变化时缓存失效）。
+	// 排序后每次重启工具顺序稳定，缓存命中率更高。
+	type namedResult struct {
+		name   string
+		client *mcp.MCPClient
+		tools  []agent.Tool
+	}
+	var allResults []namedResult
 	for r := range resultCh {
+		allResults = append(allResults, namedResult{name: r.name, client: r.client, tools: r.tools})
+	}
+	sort.Slice(allResults, func(i, j int) bool { return allResults[i].name < allResults[j].name })
+
+	var mcpClients []*mcp.MCPClient
+	for _, r := range allResults {
 		mcpClients = append(mcpClients, r.client)
 		for _, t := range r.tools {
 			ag.RegisterTool(t)
@@ -309,16 +397,6 @@ func initMCPServer(ctx context.Context, name string, mcpCfg config.MCPServerConf
 	}
 
 	return client, mcpTools, nil
-}
-
-// contains 检查字符串切片是否包含目标值。
-func contains(slice []string, target string) bool {
-	for _, s := range slice {
-		if s == target {
-			return true
-		}
-	}
-	return false
 }
 
 // hashKey 对密钥做 SHA256 哈希并取前 16 个十六进制字符，
@@ -351,14 +429,15 @@ func hashHeaders(headers map[string]string) string {
 
 // stableSessionID 基于 chatName 与用户主目录生成稳定的 Session ID。
 //
-// 使用 SHA256 哈希取前 8 字符作为后缀，保证：
+// 使用 SHA256 哈希取前 16 个十六进制字符（64 位熵）作为后缀，保证：
 //   - 同一用户、同一 chatName 始终映射到同一 Session（跨重启可恢复历史）；
-//   - 不同用户或不同 chatName 产生不同的 Session。
+//   - 不同用户或不同 chatName 产生不同的 Session；
+//   - 64 位熵空间在单机场景下碰撞概率可忽略。
 //
 // homeDir 由调用方传入，避免重复调用 os.UserHomeDir()。
 func stableSessionID(chatName, homeDir string) string {
 	raw := fmt.Sprintf("%s:%s", chatName, homeDir)
 	h := sha256.Sum256([]byte(raw))
-	suffix := hex.EncodeToString(h[:])[:8]
+	suffix := hex.EncodeToString(h[:])[:16]
 	return fmt.Sprintf("%s_%s", chatName, suffix)
 }

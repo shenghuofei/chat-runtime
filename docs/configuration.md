@@ -55,6 +55,7 @@ server:           # Web 服务配置（端口、鉴权）
 | `api_key`   | string | 视类型而定 | API 密钥。建议用环境变量注入，见第 9 节                |
 | `base_url`  | string | 否   | 自定义 API endpoint，用于代理、私有部署或兼容网关       |
 | `timeout`   | string | 否   | 请求超时时间，如 `60s`、`2m`                            |
+| `headers`   | map    | 否   | 额外的自定义请求头，适用于代理鉴权、路由标记等场景      |
 
 ### 2.2 支持的 Provider 类型
 
@@ -125,6 +126,7 @@ providers:
 | `temperature`   | float   | 否   | 采样温度，0~2，越高越发散                             |
 | `max_tokens`    | int     | 否   | 单次响应的最大生成 token 数                          |
 | `top_p`         | float   | 否   | 核采样参数                                           |
+| `reasoner`      | bool    | 否   | 显式声明为推理模型（如 `deepseek-reasoner`、`o1` 等）。推理模型通常不支持 `temperature`/`top_p`；若不设置，某些 Provider 会根据模型名做启发式判断 |
 
 ```yaml
 models:
@@ -154,6 +156,8 @@ models:
 |-------------------|---------------|------|----------------------------------------------------------|
 | `model`           | string        | 是   | 引用 `models` 中的名称                                   |
 | `system`          | string        | 否   | 系统提示词，支持 `@file:` 引用与 Go 模板变量（见 4.1/4.2）|
+| `default`         | bool          | 否   | 是否为默认对话（未指定 `--chat` 时加载）。多个 `true` 时行为不确定，建议只设一个 |
+| `max_iterations`  | int           | 否   | Tool Calling 循环的最大迭代次数，防止无限循环（0 表示不限）|
 | `tools`           | list<string>  | 否   | 该对话可用的工具/工具组，缺省表示全部可用                 |
 | `mcp_servers`     | list<string>  | 否   | 该对话启用的 MCP Server 名称，缺省表示全部启用            |
 | `context_manager` | object        | 否   | 覆盖全局 `context_manager`，见第 7 节                    |
@@ -367,13 +371,20 @@ chats:
 
 `server` 配置 Web 服务模式（`serve` 子命令）的监听与鉴权。命令行参数（如 `--port`）优先级高于配置文件。
 
-| 参数                   | 类型   | 默认       | 说明                                   |
-|------------------------|--------|------------|----------------------------------------|
-| `host`                 | string | `0.0.0.0`  | 监听地址                               |
-| `port`                 | int    | `8080`     | 监听端口                               |
-| `basic_auth.enabled`   | bool   | `false`    | 是否启用 HTTP Basic Auth               |
-| `basic_auth.username`  | string | -          | Basic Auth 用户名                      |
-| `basic_auth.password`  | string | -          | Basic Auth 密码，建议用环境变量注入     |
+| 参数                   | 类型     | 默认      | 说明                                                               |
+|------------------------|----------|-----------|--------------------------------------------------------------------|
+| `host`                 | string   | `0.0.0.0` | 监听地址                                                           |
+| `port`                 | int      | `8080`    | 监听端口                                                           |
+| `basic_auth.enabled`   | bool     | `false`   | 是否启用 HTTP Basic Auth                                           |
+| `basic_auth.username`  | string   | -         | Basic Auth 用户名                                                  |
+| `basic_auth.password`  | string   | -         | Basic Auth 密码，建议用环境变量注入                                 |
+| `max_sessions`         | int      | `100`     | 最大并发会话数，防止连接数无上限导致 DoS。`-1` 表示不限制（公网环境慎用）|
+| `approval_timeout`     | duration | `5m`      | Web 审批等待超时，超时后自动拒绝                                   |
+| `shutdown_timeout`     | duration | `15s`     | 优雅关闭的最大等待时间，超时后强制停止                             |
+| `read_header_timeout`  | duration | `10s`     | HTTP 读取请求头的超时，防范慢速连接攻击                            |
+| `ping_interval`        | duration | `30s`     | WebSocket 心跳发送间隔                                             |
+| `pong_wait`            | duration | `45s`     | 等待 pong 响应的超时，应大于 `ping_interval`                       |
+| `write_wait`           | duration | `10s`     | WebSocket 写操作超时                                               |
 
 ```yaml
 server:
@@ -383,6 +394,9 @@ server:
     enabled: true
     username: admin
     password: ${WEB_PASSWORD}
+  max_sessions: 100          # 可选，默认 100
+  approval_timeout: 5m       # 可选，默认 5m
+  shutdown_timeout: 15s      # 可选，默认 15s
 ```
 
 > 安全建议：Web 模式会让远程用户触发工具执行，务必在暴露到公网前启用 `basic_auth` 或置于反向代理/鉴权网关之后。

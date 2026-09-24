@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -204,11 +205,29 @@ func (a *Agent) ToolNames() []string {
 }
 
 // History 返回当前会话历史（不含 system），供展示使用。
+//
+// 对于 Content 为空但含有 ToolCalls 的 assistant 消息（Tool Calling 步骤），
+// 将工具名拼接为可读描述填入 Content，避免 /history 命令显示空行。
 func (a *Agent) History() []Message {
 	raw := a.manager.Raw()
 	out := make([]Message, 0, len(raw))
 	for _, m := range raw {
-		out = append(out, Message{Role: string(m.Role), Content: m.Content})
+		content := m.Content
+		if content == "" && len(m.ToolCalls) > 0 {
+			// 最多展示前 5 个工具名，超出部分以"...等 N 个工具"代替，
+			// 防止单条工具调用消息包含数十个工具时生成过长字符串影响日志体积。
+			const maxDisplay = 5
+			names := make([]string, 0, min(len(m.ToolCalls), maxDisplay+1))
+			for i, tc := range m.ToolCalls {
+				if i >= maxDisplay {
+					names = append(names, fmt.Sprintf("...等 %d 个工具", len(m.ToolCalls)-maxDisplay))
+					break
+				}
+				names = append(names, tc.Name)
+			}
+			content = "[调用工具: " + strings.Join(names, ", ") + "]"
+		}
+		out = append(out, Message{Role: string(m.Role), Content: content})
 	}
 	return out
 }
@@ -283,6 +302,11 @@ func (a *Agent) ToolCount() int {
 func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 	if emit == nil {
 		emit = func(Event) {}
+	}
+
+	// 空输入不写入历史，避免产生空 user 消息污染上下文。
+	if strings.TrimSpace(input) == "" {
+		return nil
 	}
 
 	// safeEmit 用 mutex 包裹 emit，保证并发工具执行时的事件推送是线程安全的。
@@ -397,8 +421,14 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 				// 捕获任何 panic，避免单个工具的崩溃导致 wg.Wait 永久阻塞。
 				defer func() {
 					if r := recover(); r != nil {
-						errMsg := fmt.Sprintf("工具 %q 执行时发生 panic: %v\n%s", call.Name, r, debug.Stack())
-						safeEmit(Event{Type: EventError, Content: errMsg})
+						stack := debug.Stack()
+						// 完整堆栈仅写入服务端日志，避免将内部路径信息暴露给前端。
+						slog.Error("工具执行发生 panic", "tool", call.Name, "panic", r, "stack", string(stack))
+						errMsg := fmt.Sprintf("工具 %q 执行时发生 panic: %v", call.Name, r)
+						// ctx 已取消时不向前端推送错误事件，避免写入已关闭的连接。
+						if ctx.Err() == nil {
+							safeEmit(Event{Type: EventError, Content: errMsg})
+						}
 						results[idx] = toolResult{
 							callID: call.ID,
 							name:   call.Name,
@@ -477,20 +507,31 @@ func parseArgs(arguments string) map[string]any {
 }
 
 // deduplicateToolCalls 按 ToolCall.ID 去重，保留首次出现的条目。
-// 对无 ID 的工具调用（如 Gemini 自生成 ID 始终唯一）不影响。
+//
+// 对有 ID 的调用按 ID 去重（处理 Provider 在流中重复发送同一 ID 的情况）。
+// 对无 ID 的调用（部分 Provider 不生成 ID），以 "位置\x00名称\x00参数" 作为代理键：
+// 引入位置索引后，相同名称+参数的多次调用各自具有唯一键，不再被误判为重复——
+// LLM 可能合法地请求多次调用同一工具（如多次搜索），单纯按名称+参数去重会错误合并。
 func deduplicateToolCalls(calls []provider.ToolCall) []provider.ToolCall {
 	if len(calls) <= 1 {
 		return calls
 	}
 	seen := make(map[string]bool, len(calls))
 	out := make([]provider.ToolCall, 0, len(calls))
-	for _, tc := range calls {
-		if tc.ID != "" && seen[tc.ID] {
+	for i, tc := range calls {
+		var key string
+		if tc.ID != "" {
+			key = tc.ID
+		} else {
+			// 无 ID 时以 "位置\x00名称\x00参数" 为代理键：
+			// 不同位置的同名同参调用保留（合法多次调用），
+			// 仅当同一位置出现完全相同的条目时才视为重复并跳过。
+			key = fmt.Sprintf("\x00%d\x00%s\x00%s", i, tc.Name, tc.Arguments)
+		}
+		if seen[key] {
 			continue
 		}
-		if tc.ID != "" {
-			seen[tc.ID] = true
-		}
+		seen[key] = true
 		out = append(out, tc)
 	}
 	return out

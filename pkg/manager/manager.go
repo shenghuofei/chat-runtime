@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/shenghuofei/chat-runtime/pkg/provider"
 )
@@ -29,6 +30,10 @@ const (
 	// ModeWindow 滑动窗口：按 token 用量维持窗口。
 	ModeWindow Mode = "window"
 )
+
+// summaryMessagePrefix 是 compress 模式插入的摘要消息的固定前缀。
+// 作为具名常量统一管理，便于在检测/解析摘要消息时引用同一标记，避免硬编码字符串散布。
+const summaryMessagePrefix = "【早期对话摘要】\n"
 
 // Summarizer 是 compress 模式下用于生成摘要的回调。
 //
@@ -82,6 +87,11 @@ type Manager struct {
 	// 随消息追加 / 裁剪 / 加载实时维护，避免在 markCompressIfNeededLocked 等处
 	// 重复执行 countRoundsLocked() 的 O(N) 扫描。
 	roundCount int
+	// totalTokensEstimate 当前消息列表的估算 token 总数（实时增量维护，O(1) 读取）。
+	// ReportUsage 在 window 模式下使用此值判断是否需要裁剪，
+	// 避免每次 ReportUsage 都对全部消息做 O(N) 扫描。
+	// 在消息追加时 +estimateTokens；裁剪后重新计算（裁剪不频繁，O(N) 可接受）。
+	totalTokensEstimate int
 }
 
 // New 创建一个 Manager。
@@ -148,6 +158,7 @@ func (m *Manager) appendAndMaybeOverflow(msg provider.Message) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.messages = append(m.messages, msg)
+	m.totalTokensEstimate += estimateTokens(msg)
 	m.normalizedDirty = true
 	// 实时维护 roundCount，与 countRoundsLocked 的计数规则保持一致：
 	//   - user 消息：新轮次开始，+1；
@@ -188,11 +199,8 @@ func (m *Manager) ReportUsage(usage provider.TokenUsage) {
 		return
 	}
 
-	// 完全基于估算值计算当前上下文总 token 数。
-	totalEstimate := 0
-	for _, msg := range m.messages {
-		totalEstimate += estimateTokens(msg)
-	}
+	// 使用增量维护的 totalTokensEstimate（O(1)），避免每次 ReportUsage 都对全部消息做 O(N) 扫描。
+	totalEstimate := m.totalTokensEstimate
 
 	ratio := m.config.CompressRatio
 	if ratio <= 0 {
@@ -287,6 +295,7 @@ func (m *Manager) Load(messages []provider.Message) {
 	copy(m.messages, messages)
 	m.normalizedDirty = true
 	m.roundCount = m.countRoundsLocked()
+	m.totalTokensEstimate = m.calcTotalTokensLocked()
 }
 
 // Raw 返回不含 system、未经标准化的原始历史副本（用于持久化）。
@@ -300,19 +309,36 @@ func (m *Manager) Raw() []provider.Message {
 
 // -------------------- 内部裁剪逻辑（调用方需持有锁） --------------------
 
+// calcTotalTokensLocked 遍历当前消息列表，重新计算估算 token 总数。
+// 仅在裁剪、压缩、Load 等批量操作后调用，摊销 O(N) 代价。
+func (m *Manager) calcTotalTokensLocked() int {
+	total := 0
+	for _, msg := range m.messages {
+		total += estimateTokens(msg)
+	}
+	return total
+}
+
 // estimateTokens 基于消息内容长度估算 token 数。
 //
-// 粗略估算规则：1 token ≈ 4 个字符（英文），中文约 1 token ≈ 2 字符。
-// 这里取折中值 3 字符/token，再加上消息结构开销（role、tool_call_id 等）。
-// 虽然不如 tiktoken 精准，但足够用于裁剪决策。
+// 使用 rune（Unicode 码点）计数替代字节计数：
+//   - 旧方案 len(s)/3 对中文严重低估（UTF-8 每个汉字占 3 字节，
+//     按字节数/3 约等于字符数，但中文实际约 1~2 rune/token）；
+//   - 新方案 RuneCount/2 取更保守的估计，对中文准确，对英文略有高估
+//     （英文约 4 chars/token，但高估比低估更安全——宁早裁剪、不超窗口）。
 func estimateTokens(msg provider.Message) int {
 	// 消息结构固定开销（role、分隔符等），约 4 token。
 	const overhead = 4
-	charCount := len(msg.Content) + len(msg.Name)
+	runeCount := utf8.RuneCountInString(msg.Content) +
+		utf8.RuneCountInString(msg.Name) +
+		utf8.RuneCountInString(msg.ToolCallID) // tool 结果的 ID 也需纳入估算
 	for _, tc := range msg.ToolCalls {
-		charCount += len(tc.Name) + len(tc.Arguments)
+		runeCount += utf8.RuneCountInString(tc.ID) +
+			utf8.RuneCountInString(tc.Type) +
+			utf8.RuneCountInString(tc.Name) +
+			utf8.RuneCountInString(tc.Arguments)
 	}
-	return overhead + charCount/3
+	return overhead + runeCount/2
 }
 
 // countRoundsLocked 统计历史中的轮次数量。
@@ -364,7 +390,12 @@ func (m *Manager) keepLastRoundsLocked(n int) {
 		return
 	}
 	start := starts[len(starts)-n]
-	m.messages = m.messages[start:]
+	// 拷贝而非直接切片，释放对原底层数组的引用：
+	// m.messages[start:] 仍持有原数组头部（已被丢弃）的引用，
+	// 导致 GC 无法回收那部分内存；复制后原数组可被完整回收。
+	kept := make([]provider.Message, len(m.messages)-start)
+	copy(kept, m.messages[start:])
+	m.messages = kept
 	// 裁剪可能从某轮中间切开，导致 tool 结果失去对应的 assistant.tool_calls
 	// （或反之）。标准化以修复游离的 tool 结果，保证配对合法。
 	m.messages = NormalizeToolMessages(m.messages)
@@ -373,6 +404,8 @@ func (m *Manager) keepLastRoundsLocked(n int) {
 	m.normalizedDirty = false
 	// keepLastRoundsLocked 精确保留 n 轮，同步字段避免后续重复扫描。
 	m.roundCount = n
+	// 裁剪后重新计算估算值（裁剪不频繁，O(N) 可接受）。
+	m.totalTokensEstimate = m.calcTotalTokensLocked()
 }
 
 // truncateByRoundsLocked truncate 模式：超过 MaxRounds 时丢弃最早轮次。
@@ -457,19 +490,32 @@ func (m *Manager) CompressIfNeeded() {
 	}
 
 	if err != nil {
-		// 摘要失败则退化为直接截断，保证上下文体积可控。
-		slog.Warn("compress 摘要失败，退化为截断早期历史", "error", err, "truncated_messages", compressCount)
-		m.messages = m.messages[compressCount:]
-		m.messages = NormalizeToolMessages(m.messages)
-		m.normalizedCache = m.messages
-		m.normalizedDirty = false
-		m.roundCount = m.countRoundsLocked()
+		// 摘要失败则退化为按轮次截断，保证上下文体积可控。
+		// 使用 keepLastRoundsLocked 而非直接切片，避免在轮次中间截断导致
+		// tool_call/result 配对失效（直接切片可能从某轮中间开始，游离的 tool
+		// 结果找不到对应的 assistant.tool_calls，引发 Provider 格式错误）。
+		// 记录丢弃消息数，便于运维定位历史丢失范围。
+		dropCount := compressCount
+		if dropCount > len(m.messages) {
+			dropCount = len(m.messages)
+		}
+		slog.Error("compress 摘要失败，退化为按轮次截断早期历史",
+			"error", err,
+			"dropped_messages", dropCount,
+			"kept_rounds", m.config.MaxRounds,
+		)
+		// 防御：MaxRounds<=0 时 keepLastRoundsLocked 是 no-op，改用保留最近 1 轮确保截断。
+		if m.config.MaxRounds > 0 {
+			m.keepLastRoundsLocked(m.config.MaxRounds)
+		} else {
+			m.keepLastRoundsLocked(1)
+		}
 		return
 	}
 
 	summaryMsg := provider.Message{
 		Role:    provider.RoleSystem,
-		Content: "【早期对话摘要】\n" + summary,
+		Content: summaryMessagePrefix + summary,
 	}
 	rest := m.messages[compressCount:]
 	newMsgs := make([]provider.Message, 0, len(rest)+1)
@@ -483,6 +529,7 @@ func (m *Manager) CompressIfNeeded() {
 	// 压缩后重新计算轮次。此路径已含 LLM 调用，O(N) 重算无额外影响。
 	// 注：步骤 2（锁外）期间可能有新消息追加，直接数比用 MaxRounds 更准确。
 	m.roundCount = m.countRoundsLocked()
+	m.totalTokensEstimate = m.calcTotalTokensLocked()
 }
 
 // -------------------- 工具消息标准化与校验（无状态工具函数） --------------------

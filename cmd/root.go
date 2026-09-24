@@ -38,11 +38,14 @@ var (
 )
 
 // AgentFactory 由上层装配（wiring）代码在初始化时注入，
-// 根据配置与对话名创建一个已注册工具的 Agent，并返回用于释放资源的清理函数。
+// 根据配置、对话名与会话 ID 创建一个已注册工具的 Agent，并返回用于释放资源的清理函数。
+//
+// sessionID 为空时由工厂自行决定 ID（CLI 模式使用稳定哈希 ID 以跨重启恢复历史，
+// Web 新会话使用随机 ID）；非空时工厂使用该 ID 加载对应历史（Web Resume 场景）。
 //
 // 通过包级变量注入而非直接依赖具体装配逻辑，避免 cmd 包与 Provider/Tools 的
 // 构造细节耦合，也便于在测试中替换为 mock。
-type AgentFactory func(cfg *config.Config, chatName string) (ag *agent.Agent, cleanup func() error, err error)
+type AgentFactory func(cfg *config.Config, chatName string, sessionID string) (ag *agent.Agent, cleanup func() error, err error)
 
 // agentFactory 保存注入的工厂实现。
 var agentFactory AgentFactory
@@ -112,7 +115,9 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	if agentFactory == nil {
 		return errors.New("AgentFactory 未初始化：请在启动时调用 cmd.SetAgentFactory 注册装配实现")
 	}
-	ag, cleanup, err := agentFactory(cfg, chatName)
+	// CLI 模式传入空字符串，由 buildAgent 基于 chatName + 主目录生成稳定 ID，
+	// 保证跨重启能恢复同一会话的历史。
+	ag, cleanup, err := agentFactory(cfg, chatName, "")
 	if err != nil {
 		return fmt.Errorf("创建 Agent 失败: %w", err)
 	}
@@ -169,8 +174,11 @@ func runREPL(ag *agent.Agent, quitCh <-chan struct{}) error {
 	printBanner()
 
 	// 历史记录文件：存放在 ~/.chat-runtime/history。
+	// 目录以 0o700（仅属主可读写执行）创建，防止其他用户读取含敏感内容的历史记录。
 	homeDir, _ := os.UserHomeDir()
-	historyFile := filepath.Join(homeDir, ".chat-runtime", "history")
+	historyDir := filepath.Join(homeDir, ".chat-runtime")
+	_ = os.MkdirAll(historyDir, 0o700)
+	historyFile := filepath.Join(historyDir, "history")
 
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:            "\033[1;36m你 >\033[0m ",
@@ -202,7 +210,9 @@ func runREPL(ag *agent.Agent, quitCh <-chan struct{}) error {
 		var res readResult
 		select {
 		case <-quitCh:
-			// 收到 SIGTERM：优雅退出，返回后由上层 defer 执行 cleanup。
+			// 收到 SIGTERM：关闭 readline 使 Readline() goroutine 收到 io.EOF 并退出，
+			// 防止 goroutine 永久阻塞在终端 I/O（defer rl.Close() 也会调用，幂等安全）。
+			rl.Close()
 			fmt.Println("\n再见 👋")
 			return nil
 		case res = <-lineCh:

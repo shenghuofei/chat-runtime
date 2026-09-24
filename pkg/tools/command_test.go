@@ -2,31 +2,26 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 )
 
-// mustJSON 将命令与参数拼成工具入参 JSON（测试辅助）。
+// mustJSON 将命令与参数序列化为工具入参 JSON（测试辅助）。
+//
+// 使用 encoding/json 而非手工拼接，确保特殊字符（引号、反斜杠、控制字符等）
+// 被正确转义，避免生成无效 JSON 导致测试误判。
 func mustJSON(command string, args ...string) string {
-	var b strings.Builder
-	b.WriteString(`{"command":"`)
-	b.WriteString(command)
-	b.WriteString(`"`)
-	if len(args) > 0 {
-		b.WriteString(`,"args":[`)
-		for i, a := range args {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString(`"`)
-			b.WriteString(a)
-			b.WriteString(`"`)
-		}
-		b.WriteString(`]`)
+	type payload struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args,omitempty"`
 	}
-	b.WriteString(`}`)
-	return b.String()
+	b, err := json.Marshal(payload{Command: command, Args: args})
+	if err != nil {
+		panic("mustJSON: json.Marshal failed: " + err.Error())
+	}
+	return string(b)
 }
 
 // TestExecuteAllowedCommand 验证白名单内命令可正常执行并返回输出。

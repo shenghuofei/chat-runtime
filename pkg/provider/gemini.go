@@ -16,11 +16,12 @@ package provider
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 )
 
 const (
@@ -158,16 +159,12 @@ func (p *geminiProvider) Chat(ctx context.Context, messages []Message, tools []T
 		return nil, fmt.Errorf("gemini: 序列化请求体失败: %w", err)
 	}
 
-	// Gemini 鉴权改用 x-goog-api-key 请求头传递 API Key，
+	// Gemini 鉴权通过 x-goog-api-key 请求头传递 API Key（由 headerGoogleKey 在 setHeaders 中设置），
 	// 不再将 key 明文拼入 URL query，避免其出现在 URL / 日志 / 代理记录中。
-	// 通过 headerGoogleKey 让 setHeaders 设置该请求头；同时用 extraSetup 兜底确保设置。
+	// 无需额外的 extraSetup 回调重复设置同一请求头。
 	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse",
 		p.baseURL, p.model)
-	resp, err := p.doWithRetry(ctx, url, payload, headerGoogleKey, func(req *http.Request) {
-		if p.apiKey != "" {
-			req.Header.Set("x-goog-api-key", p.apiKey)
-		}
-	})
+	resp, err := p.doWithRetry(ctx, url, payload, headerGoogleKey, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -289,9 +286,15 @@ func (p *geminiProvider) streamResponse(ctx context.Context, resp *http.Response
 
 	reader := bufio.NewReader(resp.Body)
 	// 用于生成唯一的 tool_call ID。
-	// 加入 UnixNano 前缀防止同一会话多轮调用产生重复 ID（如每轮都有 call_1），
-	// 避免 NormalizeToolMessages 按 ID 配对时错配历史消息。
-	idPrefix := fmt.Sprintf("gc_%d", time.Now().UnixNano())
+	// 使用 crypto/rand 生成前缀，防止同一会话多轮调用产生重复 ID（如每轮都有 call_1）。
+	// 避免使用 time.Now().UnixNano()：在某些平台（如 Windows）时钟精度仅毫秒级，
+	// 同一毫秒内多次调用会产生相同前缀，导致 ID 碰撞。
+	var randBuf [8]byte
+	if _, err := cryptorand.Read(randBuf[:]); err != nil {
+		// crypto/rand 极少失败；退化为确定性占位符（每次调用内 counter 仍保证唯一）。
+		copy(randBuf[:], []byte("fallback"))
+	}
+	idPrefix := "gc_" + hex.EncodeToString(randBuf[:])
 	toolCallCounter := 0
 
 	readSSELines(ctx, reader, func(data string) bool {
@@ -307,6 +310,11 @@ func (p *geminiProvider) streamResponse(ctx context.Context, resp *http.Response
 
 		// 处理 candidates
 		for _, candidate := range chunk.Candidates {
+			// 先收集当前 candidate 所有 parts 中的文本与工具调用，
+			// 再统一发送工具调用事件（附带 FinishReason）。
+			// 避免每个 functionCall part 各自发送一次 FinishReason:"tool_calls"
+			// 导致上层循环多次触发工具执行逻辑。
+			var candidateToolCalls []ToolCall
 			for _, part := range candidate.Content.Parts {
 				if part.Text != "" {
 					sendResponse(ctx, out, StreamResponse{
@@ -314,23 +322,27 @@ func (p *geminiProvider) streamResponse(ctx context.Context, resp *http.Response
 					})
 				}
 				if part.FunctionCall != nil {
-					// Gemini 的 functionCall 是完整的（非流式分片），直接输出
+					// Gemini 的 functionCall 是完整的（非流式分片），累积后统一输出。
 					argsJSON, _ := json.Marshal(part.FunctionCall.Args)
 					toolCallCounter++
-					sendResponse(ctx, out, StreamResponse{
-						Delta: Delta{
-							ToolCalls: []ToolCall{{
-								ID:        fmt.Sprintf("%s_%d", idPrefix, toolCallCounter),
-								Name:      part.FunctionCall.Name,
-								Arguments: string(argsJSON),
-							}},
-							FinishReason: "tool_calls",
-						},
+					candidateToolCalls = append(candidateToolCalls, ToolCall{
+						ID:        fmt.Sprintf("%s_%d", idPrefix, toolCallCounter),
+						Name:      part.FunctionCall.Name,
+						Arguments: string(argsJSON),
 					})
 				}
 			}
+			// 若有工具调用，合并为一个事件，FinishReason 仅发送一次。
+			if len(candidateToolCalls) > 0 {
+				sendResponse(ctx, out, StreamResponse{
+					Delta: Delta{
+						ToolCalls:    candidateToolCalls,
+						FinishReason: "tool_calls",
+					},
+				})
+			}
 
-			// 处理 finishReason
+			// 处理 finishReason（非 tool_calls 情况下单独发送）
 			if candidate.FinishReason != "" {
 				var mappedReason string
 				switch candidate.FinishReason {
@@ -343,7 +355,7 @@ func (p *geminiProvider) streamResponse(ctx context.Context, resp *http.Response
 				default:
 					mappedReason = strings.ToLower(candidate.FinishReason)
 				}
-				// 仅在非 tool_calls 时发送（tool_calls 已在 functionCall 分支中发送）
+				// tool_calls 情况下 FinishReason 已在上方随工具调用列表一并发送。
 				if mappedReason != "" && mappedReason != "tool_calls" {
 					sendResponse(ctx, out, StreamResponse{
 						Delta: Delta{FinishReason: mappedReason},

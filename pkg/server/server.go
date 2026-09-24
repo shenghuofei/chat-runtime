@@ -15,10 +15,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,11 +35,14 @@ import (
 	"github.com/shenghuofei/chat-runtime/pkg/web"
 )
 
-// AgentFactory 根据配置与对话名创建一个已注册工具的 Agent，并返回释放资源的清理函数。
+// AgentFactory 根据配置、对话名与会话 ID 创建一个已注册工具的 Agent，并返回释放资源的清理函数。
+//
+// sessionID 为空时由工厂自行生成（CLI 模式稳定 ID，Web 模式随机 ID）；
+// 非空时工厂使用该 ID 加载对应的历史会话（Web 模式 Resume 场景）。
 //
 // 采用工厂函数而非直接构造，便于为每个 WebSocket 会话独立创建 Agent，
 // 同时方便在测试中注入 mock 实现。
-type AgentFactory func(cfg *config.Config, chatName string) (ag *agent.Agent, cleanup func() error, err error)
+type AgentFactory func(cfg *config.Config, chatName string, sessionID string) (ag *agent.Agent, cleanup func() error, err error)
 
 // Server 级别的超时均从 cfg.Server 读取，在 config.applyDefaults 中已填入合理默认值。
 // 这里保留常量仅作文档说明，不再被实际代码引用。
@@ -74,14 +80,104 @@ type Session struct {
 	// approval Web 审批处理器，负责下发审批请求与匹配响应。
 	approval *agent.WSApprovalHandler
 
-	// lastActiveAt 会话最近活跃时间，用于 LRU 淘汰时选出空闲最久的会话。
+	// lastActiveAtNano 会话最近活跃时间（UnixNano），用于 LRU 淘汰时选出空闲最久的会话。
 	// 创建时初始化为当前时间，每次收到 chat 消息时更新。
-	lastActiveAt time.Time
+	// 使用 atomic.Int64 避免在 evictOldestSessionLocked（仅持 sessionsMu）中
+	// 读取与 dispatch（持 sess.mu）写入之间的数据竞争。
+	lastActiveAtNano atomic.Int64
+
+	// msgRL 单会话消息速率限制器（每分钟最多 60 条 chat 消息）。
+	msgRL *msgRateLimiter
+
+	// runMu 串行化同一会话内的多个并发生成：
+	// 用户快速连发两条 chat 消息时，dispatch 会启动两个 runChat goroutine。
+	// 第二个 goroutine 等待第一个完成后才开始执行，避免两个 agent.Run 并发写入
+	// manager，导致消息顺序错乱（两条 user 消息交错追加到历史）。
+	runMu sync.Mutex
 
 	// mu 保护对 WebSocket 的并发写与 cancel 的读写。
 	mu sync.Mutex
 	// cancel 用于取消当前正在进行的生成（type=stop）。
 	cancel context.CancelFunc
+}
+
+// wsRateLimiter 基于固定时间窗口的 per-IP WebSocket 连接速率限制器。
+// 在每个时间窗口内，同一 IP 最多允许建立 maxPerWindow 个新连接。
+type wsRateLimiter struct {
+	mu           sync.Mutex
+	entries      map[string]*wsRLEntry
+	maxPerWindow int
+	window       time.Duration
+}
+
+type wsRLEntry struct {
+	count     int
+	windowEnd time.Time
+}
+
+func newWSRateLimiter(maxPerWindow int, window time.Duration) *wsRateLimiter {
+	return &wsRateLimiter{
+		entries:      make(map[string]*wsRLEntry),
+		maxPerWindow: maxPerWindow,
+		window:       window,
+	}
+}
+
+// allow 检查 ip 是否允许建立新连接，同时更新计数。
+// 超出窗口期的旧条目在下次访问时懒惰清理。
+func (rl *wsRateLimiter) allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	entry, ok := rl.entries[ip]
+	if !ok || now.After(entry.windowEnd) {
+		rl.entries[ip] = &wsRLEntry{count: 1, windowEnd: now.Add(rl.window)}
+		return true
+	}
+	if entry.count >= rl.maxPerWindow {
+		return false
+	}
+	entry.count++
+	return true
+}
+
+// cleanupExpired 清除所有已过期的 IP 条目，防止长期运行后内存中积累大量废旧条目。
+func (rl *wsRateLimiter) cleanupExpired() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	for ip, e := range rl.entries {
+		if now.After(e.windowEnd) {
+			delete(rl.entries, ip)
+		}
+	}
+}
+
+// msgRateLimiter 是单个 WebSocket 会话内的消息速率限制器（固定时间窗口）。
+// 防止已连接的客户端通过高频 chat 消息触发大量 LLM API 调用。
+type msgRateLimiter struct {
+	mu           sync.Mutex
+	count        int
+	windowEnd    time.Time
+	maxPerWindow int
+	window       time.Duration
+}
+
+// allow 检查当前会话是否允许再发送一条消息。
+func (ml *msgRateLimiter) allow() bool {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	now := time.Now()
+	if now.After(ml.windowEnd) {
+		ml.count = 1
+		ml.windowEnd = now.Add(ml.window)
+		return true
+	}
+	if ml.count >= ml.maxPerWindow {
+		return false
+	}
+	ml.count++
+	return true
 }
 
 // Server 是 Web 服务的主结构。
@@ -98,10 +194,16 @@ type Server struct {
 	upgrader websocket.Upgrader
 	// logger 结构化日志器。
 	logger *slog.Logger
+	// wsRateLimiter per-IP WebSocket 连接速率限制器。
+	wsRateLimiter *wsRateLimiter
 
 	// sessions 活跃会话表，key 为会话 ID。
 	sessions   map[string]*Session
 	sessionsMu sync.RWMutex
+
+	// done 关闭信号 channel：Close() 或 Start() 完成后关闭，
+	// 通知后台 goroutine（如 wsRateLimiter 清理定时器）退出，防止测试中泄漏。
+	done chan struct{}
 
 	// stats 服务运行统计。
 	stats struct {
@@ -115,12 +217,14 @@ type Server struct {
 // store 用于会话管理 API（列出/删除会话），可为 nil（此时管理 API 返回 501）。
 func NewServer(cfg *config.Config, factory AgentFactory, st store.Store) *Server {
 	s := &Server{
-		cfg:      cfg,
-		factory:  factory,
-		store:    st,
-		router:   mux.NewRouter(),
-		logger:   slog.Default(),
-		sessions: make(map[string]*Session),
+		cfg:           cfg,
+		factory:       factory,
+		store:         st,
+		router:        mux.NewRouter(),
+		logger:        slog.Default(),
+		sessions:      make(map[string]*Session),
+		done:          make(chan struct{}),
+		wsRateLimiter: newWSRateLimiter(10, time.Minute), // 每 IP 每分钟最多 10 次新连接
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -145,6 +249,24 @@ func NewServer(cfg *config.Config, factory AgentFactory, st store.Store) *Server
 	}
 	s.stats.startTime = time.Now()
 	s.routes()
+
+	// 每 5 分钟清理 wsRateLimiter 中已过期的 IP 条目，
+	// 防止长期运行后内存中积累大量废旧条目（每个条目约 40 字节，通常可忽略，
+	// 但 DoS 场景下大量不同 IP 连接会使 map 持续增长）。
+	// 通过 s.done channel 感知 Server 关闭，避免测试中 goroutine 泄漏。
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.wsRateLimiter.cleanupExpired()
+			case <-s.done:
+				return
+			}
+		}
+	}()
+
 	return s
 }
 
@@ -152,6 +274,11 @@ func NewServer(cfg *config.Config, factory AgentFactory, st store.Store) *Server
 func (s *Server) routes() {
 	// 访问日志中间件对所有路由生效。
 	s.router.Use(s.accessLog)
+
+	// 若配置了 CORS 白名单，则启用 CORS 中间件。
+	if len(s.cfg.Server.AllowedOrigins) > 0 {
+		s.router.Use(s.corsMiddleware)
+	}
 
 	// 若启用 Basic Auth，则包裹鉴权中间件。
 	if s.cfg.Server.BasicAuth.Enabled {
@@ -221,8 +348,23 @@ func (s *Server) Start(addr string) error {
 
 	// 关闭所有 WebSocket 会话（持久化 + 释放 Provider 资源）。
 	s.closeAllSessions()
+	// 关闭后台 goroutine（wsRateLimiter 清理定时器等）。
+	s.Close()
 	s.logger.Info("所有会话已关闭，服务退出")
 	return nil
+}
+
+// Close 停止 Server 的后台 goroutine（如 wsRateLimiter 清理定时器）。
+//
+// 幂等：重复调用安全。测试中应在 NewServer 后 defer s.Close() 防止 goroutine 泄漏。
+// Start() 完成时会自动调用，生产场景无需手动调用。
+func (s *Server) Close() {
+	select {
+	case <-s.done:
+		// 已关闭，幂等返回。
+	default:
+		close(s.done)
+	}
 }
 
 // closeAllSessions 关闭所有活跃的 WebSocket 会话。
@@ -239,6 +381,9 @@ func (s *Server) closeAllSessions() {
 		// 先取消正在进行的生成，再清理资源，避免 cleanup（持久化）与仍在运行的
 		// runChat goroutine 之间产生写入竞争。
 		sess.stop()
+		// 等待 runChat 释放 runMu，确保所有消息已追加到 store 后再 Persist/Release。
+		sess.runMu.Lock()
+		sess.runMu.Unlock() //nolint:staticcheck
 		if sess.cleanup != nil {
 			if err := sess.cleanup(); err != nil {
 				s.logger.Warn("关闭会话失败", "session", sess.ID, "error", err)
@@ -256,16 +401,42 @@ func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 
 // handleWebSocket 处理 WebSocket 连接的升级与消息循环。
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// 安全加固：不再从 query / cookie 读取客户端指定的 session ID，
-	// 一律由服务端生成，防止客户端劫持或猜测他人会话。
-	sessionID := newID()
+	// per-IP 速率限制：防止恶意客户端快速建立大量连接触发大量 LLM API 调用。
+	// 取 RemoteAddr 中的 IP 部分（格式为 "ip:port"）。
+	ip := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		ip = host
+	}
+	if !s.wsRateLimiter.allow(ip) {
+		http.Error(w, "连接过于频繁，请稍后重试", http.StatusTooManyRequests)
+		return
+	}
+
+	// Session ID 决策：
+	//   - resume_session_id 非空：恢复指定历史会话（工厂使用该 ID 加载对应的历史）；
+	//   - 否则：由服务端生成新的随机 ID，防止客户端劫持或猜测他人会话。
+	// 注意：单用户部署场景下 resume_session_id 无需鉴权保护，
+	// 多用户场景应在 BasicAuth 或更上层实现 session 隔离。
+	var sessionID string
+	if resumeID := r.URL.Query().Get("resume_session_id"); resumeID != "" {
+		// 防止路径穿越：拒绝含路径分隔符或 ".." 的 ID，避免攻击者构造
+		// 如 "../../etc/passwd" 的 ID 访问非预期文件。
+		if strings.ContainsAny(resumeID, "/\\") || strings.Contains(resumeID, "..") {
+			http.Error(w, "无效的 session_id", http.StatusBadRequest)
+			return
+		}
+		sessionID = resumeID
+	} else {
+		sessionID = newID()
+	}
 
 	// 仅保留对话预设名（chat name）参数（缺省为 default）。
 	chatName := r.URL.Query().Get("chat")
 
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		s.logger.Warn("WebSocket 升级失败", "error", err)
+		// 升级失败通常是客户端协议不合规或网络问题，使用 Error 级别以便运维及时发现。
+		s.logger.Error("WebSocket 升级失败", "remote", r.RemoteAddr, "error", err)
 		return
 	}
 	defer conn.Close()
@@ -335,10 +506,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dispatch(conn *websocket.Conn, sess *Session, msg ClientMessage) {
 	switch msg.Type {
 	case "chat":
+		// per-session 消息速率限制：防止单会话高频发消息触发大量 LLM API 调用。
+		if !sess.msgRL.allow() {
+			s.send(conn, sess, agent.Event{Type: agent.EventError, Content: "消息发送过于频繁，请稍后重试"})
+			return
+		}
 		// 更新会话最近活跃时间，用于 LRU 淘汰空闲最久的会话。
-		sess.mu.Lock()
-		sess.lastActiveAt = time.Now()
-		sess.mu.Unlock()
+		sess.lastActiveAtNano.Store(time.Now().UnixNano())
 		// 新的一轮对话：异步执行，避免阻塞读取循环（以便处理 stop / approval）。
 		go s.runChat(conn, sess, msg.Content)
 	case "stop":
@@ -358,13 +532,17 @@ func (s *Server) dispatch(conn *websocket.Conn, sess *Session, msg ClientMessage
 
 // runChat 执行一轮对话生成，将事件流式推送回前端。
 func (s *Server) runChat(conn *websocket.Conn, sess *Session, content string) {
+	// 串行化：同一会话同时只能有一个生成在运行。
+	// 用户快速连发两条消息时，dispatch 会启动两个 goroutine，第二个在此等待，
+	// 避免两个 agent.Run 并发追加消息导致历史乱序。
+	sess.runMu.Lock()
+	defer sess.runMu.Unlock()
+
 	s.stats.totalRequests.Add(1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// 取消上一轮未完成的生成（若有），再登记新的 cancel。
-	// 防止用户快速连发两条 chat 消息时，两个 goroutine 同时跑 agent.Run
-	// 导致用户消息交错追加、历史乱序。
 	sess.mu.Lock()
 	if sess.cancel != nil {
 		sess.cancel()
@@ -430,18 +608,21 @@ func (s *Server) createSession(id, chatName string, conn *websocket.Conn) *Sessi
 	}
 
 	// 2. 锁外执行耗时的 Agent 创建（MCP 握手、HTTP 连接等）。
-	ag, cleanup, err := s.factory(s.cfg, chatName)
+	// 将 sessionID 传入工厂：工厂将以此 ID 加载历史（Resume）或创建新历史。
+	ag, cleanup, err := s.factory(s.cfg, chatName, id)
 	if err != nil {
 		s.logger.Error("创建 Agent 失败", "error", err)
 		return nil
 	}
 
 	sess := &Session{
-		ID:           id,
-		agent:        ag,
-		cleanup:      cleanup,
-		lastActiveAt: time.Now(),
+		ID:      id,
+		agent:   ag,
+		cleanup: cleanup,
+		// 每分钟最多 60 条 chat 消息（平均 1 条/秒），防止单会话高频刷请求。
+		msgRL: &msgRateLimiter{maxPerWindow: 60, window: time.Minute},
 	}
+	sess.lastActiveAtNano.Store(time.Now().UnixNano())
 
 	// 绑定 Web 审批处理器：通过当前连接下发审批请求并等待前端响应。
 	sess.approval = agent.NewWSApprovalHandler(func(req agent.ApprovalRequest) error {
@@ -483,7 +664,7 @@ func (s *Server) createSession(id, chatName string, conn *websocket.Conn) *Sessi
 func (s *Server) evictOldestSessionLocked() {
 	var oldest *Session
 	for _, sess := range s.sessions {
-		if oldest == nil || sess.lastActiveAt.Before(oldest.lastActiveAt) {
+		if oldest == nil || sess.lastActiveAtNano.Load() < oldest.lastActiveAtNano.Load() {
 			oldest = sess
 		}
 	}
@@ -496,6 +677,21 @@ func (s *Server) evictOldestSessionLocked() {
 	// 异步清理被淘汰会话的资源，避免持锁期间阻塞。
 	go func(sess *Session) {
 		sess.stop()
+		// 等待正在进行的 runChat 持有的 runMu 被释放，再执行持久化清理。
+		// 若不等待，cleanup（Persist/Release）可能与仍在写入 manager/store 的
+		// runChat goroutine 并发执行，导致 store.Release() 关闭写入器后
+		// runChat 的 AppendMessage 无法落盘，末尾消息丢失。
+		sess.runMu.Lock()
+		//nolint:staticcheck // 仅用于等待 runChat 退出，不持有锁执行任何操作
+		sess.runMu.Unlock()
+		// 检查该 sessionID 是否已被重新加入 map（同 ID 断线重连/恢复），
+		// 若是则跳过 cleanup，避免关闭新会话的 store 写入器。
+		s.sessionsMu.RLock()
+		_, reAdded := s.sessions[sess.ID]
+		s.sessionsMu.RUnlock()
+		if reAdded {
+			return
+		}
 		if sess.cleanup != nil {
 			if err := sess.cleanup(); err != nil {
 				s.logger.Warn("淘汰会话时清理资源出错", "session", sess.ID, "error", err)
@@ -517,6 +713,10 @@ func (s *Server) closeSession(id string) {
 		// 先取消正在进行的生成：WebSocket 断开后 runChat goroutine 若仍在等待 LLM
 		// 响应，不取消则它会一直运行到响应返回，无法被服务端优雅关闭感知。
 		sess.stop()
+		// 等待 runChat 释放 runMu 后再执行 cleanup，防止 store.Release 关闭写入器
+		// 后 runChat 的 AppendMessage 无法落盘。
+		sess.runMu.Lock()
+		sess.runMu.Unlock() //nolint:staticcheck
 		if sess.cleanup != nil {
 			if err := sess.cleanup(); err != nil {
 				s.logger.Warn("关闭会话时出错", "session", id, "error", err)
@@ -535,12 +735,30 @@ func (sess *Session) stop() {
 	}
 }
 
-// accessLog 是访问日志中间件，记录请求方法、路径与耗时。
+// responseRecorder 包装 http.ResponseWriter，捕获实际写出的 HTTP 状态码。
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rr *responseRecorder) WriteHeader(status int) {
+	rr.status = status
+	rr.ResponseWriter.WriteHeader(status)
+}
+
+// accessLog 是访问日志中间件，记录请求方法、路径、响应状态码与耗时。
 func (s *Server) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		s.logger.Info("HTTP 请求", "remote", r.RemoteAddr, "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
+		rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		s.logger.Info("HTTP 请求",
+			"remote", r.RemoteAddr,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"duration", time.Since(start),
+		)
 	})
 }
 
@@ -563,6 +781,34 @@ func (s *Server) basicAuth(next http.Handler) http.Handler {
 // secureCompare 常量时间比较两个字符串是否相等。
 func secureCompare(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// corsMiddleware 是 CORS 中间件，按 AllowedOrigins 配置设置跨域响应头。
+//
+// 支持精确 Origin 匹配与通配符 "*"；对 OPTIONS 预检请求直接返回 204，
+// 不转发给后续处理器，避免因鉴权中间件拒绝预检请求而导致 CORS 握手失败。
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	allowed := s.cfg.Server.AllowedOrigins
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			for _, o := range allowed {
+				if o == "*" || o == origin {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+					w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+					break
+				}
+			}
+		}
+		// OPTIONS 预检请求在此终止，不往后传递（避免鉴权中间件拦截）。
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handleStats 返回服务运行统计信息。
@@ -594,31 +840,40 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, v any) {
 
 // handleListSessions 列出持久化的会话摘要。
 //
-// GET /api/sessions?chat=xxx
+// GET /api/sessions?chat=xxx&limit=20&offset=0
 //
-// 可选参数 chat 按对话预设名过滤。返回按最后修改时间降序排列的会话列表。
+// 可选参数：
+//   - chat：按对话预设名过滤；
+//   - limit：返回数量上限，默认不限制；
+//   - offset：分页偏移量，默认 0。
+//
+// 返回按最后修改时间降序排列的会话列表。
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		http.Error(w, "会话管理不可用", http.StatusNotImplemented)
 		return
 	}
 
-	infos, err := s.store.ListSessions(r.Context())
+	q := r.URL.Query()
+	filter := store.ListFilter{
+		Chat: q.Get("chat"),
+	}
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			filter.Limit = n
+		}
+	}
+	if v := q.Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			filter.Offset = n
+		}
+	}
+
+	infos, err := s.store.ListSessions(r.Context(), filter)
 	if err != nil {
 		s.logger.Error("列出会话失败", "error", err)
 		http.Error(w, "列出会话失败", http.StatusInternalServerError)
 		return
-	}
-
-	// 按 chat 名过滤（可选）。
-	if chat := r.URL.Query().Get("chat"); chat != "" {
-		filtered := make([]store.SessionInfo, 0, len(infos))
-		for _, info := range infos {
-			if info.ChatName == chat {
-				filtered = append(filtered, info)
-			}
-		}
-		infos = filtered
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]any{"sessions": infos})
@@ -640,13 +895,28 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "缺少会话 ID", http.StatusBadRequest)
 		return
 	}
+	// 防路径穿越：与 WebSocket 升级时的 session_id 校验保持一致。
+	if strings.ContainsAny(id, "/\\") || strings.Contains(id, "..") {
+		http.Error(w, "无效的会话 ID", http.StatusBadRequest)
+		return
+	}
 
-	// 若该会话当前活跃，先关闭它（持久化 + 释放资源）。
-	s.sessionsMu.RLock()
-	_, active := s.sessions[id]
-	s.sessionsMu.RUnlock()
+	// 原子地检查并移除活跃会话（持写锁，避免检查与删除之间的 TOCTOU 窗口）。
+	s.sessionsMu.Lock()
+	sess, active := s.sessions[id]
 	if active {
-		s.closeSession(id)
+		delete(s.sessions, id)
+	}
+	s.sessionsMu.Unlock()
+
+	// 在锁外清理资源，避免持锁期间执行阻塞 I/O（持久化、网络等）。
+	if active {
+		sess.stop()
+		if sess.cleanup != nil {
+			if err := sess.cleanup(); err != nil {
+				s.logger.Warn("关闭活跃会话时出错", "session", id, "error", err)
+			}
+		}
 	}
 
 	// 删除持久化文件。

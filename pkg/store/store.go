@@ -11,7 +11,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -51,9 +53,21 @@ type Store interface {
 	Delete(ctx context.Context, sessionID string) error
 	// Release 释放指定会话的内存资源（写入器、锁条目），但保留磁盘文件。
 	// Web 模式会话结束时应调用此方法，防止 sync.Map 条目与文件句柄泄漏。
-	Release(ctx context.Context, sessionID string)
-	// ListSessions 扫描持久化目录，返回所有会话的摘要信息。
-	ListSessions(ctx context.Context) ([]SessionInfo, error)
+	// 返回关闭写入器时遇到的 I/O 错误（若有），不影响 sync.Map 条目的清理。
+	Release(ctx context.Context, sessionID string) error
+	// ListSessions 扫描持久化目录，返回满足 filter 条件的会话摘要信息。
+	// filter.Chat 为空时不过滤；filter.Limit=0 时不限制返回数量。
+	ListSessions(ctx context.Context, filter ListFilter) ([]SessionInfo, error)
+}
+
+// ListFilter 会话列表过滤与分页参数。
+type ListFilter struct {
+	// Chat 按对话预设名过滤；空字符串表示不过滤。
+	Chat string
+	// Limit 返回结果数量上限；0 表示不限制。
+	Limit int
+	// Offset 结果起始偏移量（用于分页）。
+	Offset int
 }
 
 // SessionInfo 是会话列表中每条的摘要信息。
@@ -82,7 +96,7 @@ type logWriter struct {
 
 // newLogWriter 创建一个带缓冲的日志写入器。
 func newLogWriter(path string) (*logWriter, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -176,15 +190,35 @@ type FileStore struct {
 // 编译期断言：FileStore 实现了 Store 接口。
 var _ Store = (*FileStore)(nil)
 
+// maxLogMessages 是 LoadLog 单次加载的消息数量上限。
+//
+// 超出上限时返回错误而非静默截断，迫使调用方显式决策（如重建会话或清理历史），
+// 避免因大量日志一次性加载导致内存耗尽（每条消息含完整内容，百万条可能占数 GB 内存）。
+// 正常使用场景下一个会话极少超过此限（Save 成功后增量日志会被清零）。
+const maxLogMessages = 100_000
+
 // NewFileStore 创建一个 FileStore，baseDir 为持久化根目录（不存在则创建）。
 func NewFileStore(baseDir string) (*FileStore, error) {
 	if baseDir == "" {
 		return nil, fmt.Errorf("baseDir 不能为空")
 	}
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建持久化目录失败：%w", err)
 	}
 	return &FileStore{baseDir: baseDir}, nil
+}
+
+// isValidSessionID 检查 sessionID 是否合法，防止路径穿越攻击。
+//
+// 拒绝以下情况：
+//   - 空字符串；
+//   - 超过 256 字节（防止超长 ID 造成文件系统路径过长错误）；
+//   - 含路径分隔符（/ 或 \）或 ".." 序列（路径穿越防护）。
+func isValidSessionID(sessionID string) bool {
+	if sessionID == "" || len(sessionID) > 256 {
+		return false
+	}
+	return !strings.ContainsAny(sessionID, "/\\") && !strings.Contains(sessionID, "..")
 }
 
 // getState 返回指定会话 ID 对应的状态（不存在则新建）。
@@ -228,6 +262,9 @@ func writeFsync(path string, data []byte, perm os.FileMode) error {
 // fsync 保证临时文件数据在 rename 前已落盘：若进程在 rename 后崩溃，
 // 目标文件必然包含完整内容；若在 rename 前崩溃，临时文件可安全忽略。
 func (s *FileStore) Save(_ context.Context, sessionID string, data SessionData) error {
+	if !isValidSessionID(sessionID) {
+		return fmt.Errorf("无效的 sessionID %q", sessionID)
+	}
 	state := s.getState(sessionID)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -238,8 +275,9 @@ func (s *FileStore) Save(_ context.Context, sessionID string, data SessionData) 
 	}
 
 	path := s.checkpointPath(sessionID)
-	tmp := path + ".tmp"
-	if err := writeFsync(tmp, buf, 0o644); err != nil {
+	// 临时文件名加入 PID 后缀，避免多进程并发写同一 session 时临时文件互相覆盖。
+	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
+	if err := writeFsync(tmp, buf, 0o600); err != nil {
 		return fmt.Errorf("写入临时快照失败：%w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -259,6 +297,9 @@ func (s *FileStore) Save(_ context.Context, sessionID string, data SessionData) 
 //
 // 使用读锁：Load 仅读取 checkpoint 文件，不修改 state，可与 AppendMessage 并发执行。
 func (s *FileStore) Load(_ context.Context, sessionID string) (*SessionData, error) {
+	if !isValidSessionID(sessionID) {
+		return nil, fmt.Errorf("无效的 sessionID %q", sessionID)
+	}
 	state := s.getState(sessionID)
 	state.mu.RLock()
 	defer state.mu.RUnlock()
@@ -282,6 +323,9 @@ func (s *FileStore) Load(_ context.Context, sessionID string) (*SessionData, err
 // 优化：维持文件句柄不关闭，使用 bufio.Writer 批量写入，
 // 相比原实现每次 open/write/close 减少 2/3 的 syscall。
 func (s *FileStore) AppendMessage(_ context.Context, sessionID string, msg provider.Message) error {
+	if !isValidSessionID(sessionID) {
+		return fmt.Errorf("无效的 sessionID %q", sessionID)
+	}
 	state := s.getState(sessionID)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -299,12 +343,21 @@ func (s *FileStore) AppendMessage(_ context.Context, sessionID string, msg provi
 }
 
 // LoadLog 逐行读取增量日志并还原为消息列表；文件不存在时返回空切片。
+//
+// 锁策略：持写锁完成全程（flush + 读取），消除两步之间的 TOCTOU 窗口。
+// 若在 flush 后释放锁，Save 可能在我们重新获取读锁前截断日志文件，导致
+// 读到空文件、遗漏本应包含在增量日志中的消息。写锁代价略高，但 LoadLog
+// 仅在会话初始化时调用一次，不在热路径上。
 func (s *FileStore) LoadLog(_ context.Context, sessionID string) ([]provider.Message, error) {
+	if !isValidSessionID(sessionID) {
+		return nil, fmt.Errorf("无效的 sessionID %q", sessionID)
+	}
 	state := s.getState(sessionID)
+
+	// 持写锁：flush 缓冲区并读取文件，两步原子化，避免中间被 Save 截断。
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	// 如果有活跃写入器，先 flush 确保所有数据已落盘。
 	if state.writer != nil {
 		_ = state.writer.buf.Flush()
 	}
@@ -332,8 +385,18 @@ func (s *FileStore) LoadLog(_ context.Context, sessionID string) ([]provider.Mes
 			return nil, fmt.Errorf("解析增量日志行失败：%w", err)
 		}
 		msgs = append(msgs, msg)
+		// 防止超大增量日志一次性加载耗尽内存（正常情况下 Save 成功后日志会清零）。
+		if len(msgs) >= maxLogMessages {
+			return nil, fmt.Errorf(
+				"增量日志条数超过 %d 上限，文件可能已损坏；请删除会话文件 %q 后重试",
+				maxLogMessages, sessionID,
+			)
+		}
 	}
 	if err := scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			return nil, fmt.Errorf("增量日志单行超过 16 MiB 上限（文件可能已损坏）：%w", err)
+		}
 		return nil, fmt.Errorf("读取增量日志失败：%w", err)
 	}
 	return msgs, nil
@@ -344,21 +407,27 @@ func (s *FileStore) LoadLog(_ context.Context, sessionID string) ([]provider.Mes
 // Web 模式下每个连接使用随机 sessionID，会话结束时需调用此方法释放资源
 // （文件句柄与 map 条目），否则长运行服务会因大量已结束会话累积而泄漏。
 // 与 Delete 不同，Release 保留磁盘上的 checkpoint 和 log 文件。
-func (s *FileStore) Release(_ context.Context, sessionID string) {
+// 返回关闭写入器时遇到的 I/O 错误（若有），不影响 sync.Map 条目的清理。
+func (s *FileStore) Release(_ context.Context, sessionID string) error {
 	state := s.getState(sessionID)
 	state.mu.Lock()
+	var closeErr error
 	if state.writer != nil {
-		_ = state.writer.close()
+		closeErr = state.writer.close()
 		state.writer = nil
 	}
 	state.mu.Unlock()
 	s.sessions.Delete(sessionID)
+	return closeErr
 }
 
 // Delete 删除会话的快照与增量日志。对不存在的文件保持幂等（不报错）。
 // 删除成功后同时关闭写入器并清理 sync.Map 中的状态条目，避免长期运行的服务
 // 因大量短命会话造成内存泄漏。
 func (s *FileStore) Delete(_ context.Context, sessionID string) error {
+	if !isValidSessionID(sessionID) {
+		return fmt.Errorf("无效的 sessionID %q", sessionID)
+	}
 	state := s.getState(sessionID)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -381,11 +450,12 @@ func (s *FileStore) Delete(_ context.Context, sessionID string) error {
 }
 
 // ListSessions 扫描 baseDir 下所有 .json checkpoint 文件，
-// 返回每个会话的摘要信息（ID、chat 名、首条 user 消息摘要、修改时间、消息数）。
+// 返回满足 filter 条件的会话摘要信息。
 //
 // 只读操作，不获取 sessionState 锁（checkpoint 通过原子 rename 写入，
-// 读取不会看到半写内容）。按 UpdatedAt 降序排列（最近活跃的排前面）。
-func (s *FileStore) ListSessions(_ context.Context) ([]SessionInfo, error) {
+// 读取不会看到半写内容）。结果按 UpdatedAt 降序排列（最近活跃的排前面），
+// 然后根据 filter.Offset 和 filter.Limit 做分页截取。
+func (s *FileStore) ListSessions(_ context.Context, filter ListFilter) ([]SessionInfo, error) {
 	pattern := filepath.Join(s.baseDir, "*.json")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -401,22 +471,32 @@ func (s *FileStore) ListSessions(_ context.Context) ([]SessionInfo, error) {
 		// 读取文件修改时间。
 		fi, err := os.Stat(path)
 		if err != nil {
+			slog.Warn("ListSessions: 读取会话文件元信息失败，跳过", "path", path, "error", err)
 			continue // 文件可能刚被删除，跳过
 		}
 
 		// 读取 checkpoint 内容提取摘要。
 		raw, err := os.ReadFile(path)
 		if err != nil {
+			slog.Warn("ListSessions: 读取会话 checkpoint 失败，跳过", "path", path, "error", err)
 			continue
 		}
 		var data SessionData
 		if err := json.Unmarshal(raw, &data); err != nil {
+			slog.Warn("ListSessions: 解析会话 checkpoint 失败（文件可能已损坏），跳过", "path", path, "error", err)
 			continue // 损坏的 checkpoint，跳过
 		}
 
+		// 取 checkpoint 与增量日志两者中较新的修改时间作为最后活跃时间。
+		// checkpoint 只在显式 Persist 时更新，若会话结束前有消息仅写入了增量日志，
+		// 单独取 checkpoint mtime 会低报活跃时间。
+		updatedAt := fi.ModTime()
+		if lfi, lerr := os.Stat(s.logPath(sessionID)); lerr == nil && lfi.ModTime().After(updatedAt) {
+			updatedAt = lfi.ModTime()
+		}
 		info := SessionInfo{
 			ID:           sessionID,
-			UpdatedAt:    fi.ModTime(),
+			UpdatedAt:    updatedAt,
 			MessageCount: len(data.Messages),
 		}
 
@@ -425,6 +505,11 @@ func (s *FileStore) ListSessions(_ context.Context) ([]SessionInfo, error) {
 			if chatStr, ok := chat.(string); ok {
 				info.ChatName = chatStr
 			}
+		}
+
+		// 按 chat 名过滤（在构建列表时提前过滤，减少后续处理量）。
+		if filter.Chat != "" && info.ChatName != filter.Chat {
+			continue
 		}
 
 		// 取第一条 user 消息的前 80 字符作为摘要。
@@ -445,6 +530,18 @@ func (s *FileStore) ListSessions(_ context.Context) ([]SessionInfo, error) {
 
 	// 按最后修改时间降序排列。
 	sortSessionInfos(infos)
+
+	// 分页截取：先跳过 Offset 条，再取最多 Limit 条。
+	if filter.Offset > 0 {
+		if filter.Offset >= len(infos) {
+			return []SessionInfo{}, nil
+		}
+		infos = infos[filter.Offset:]
+	}
+	if filter.Limit > 0 && len(infos) > filter.Limit {
+		infos = infos[:filter.Limit]
+	}
+
 	return infos, nil
 }
 

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -34,10 +35,17 @@ type CommandToolConfig struct {
 	// AutoApprove 为 true 时所有命令自动批准（跳过审批），无论是否命中危险模式。
 	// 默认 false，即危险命令需人工审批。
 	AutoApprove bool
+	// MaxOutputBytes 单次命令输出的字节上限。
+	// 超出后采用"头尾各保留 50%"策略，中间用省略标记替代。
+	// <=0 时使用默认值 1 MiB；-1 表示不限制（谨慎使用）。
+	MaxOutputBytes int
 }
 
 // defaultCommandTimeout 默认命令执行超时。
 const defaultCommandTimeout = 30 * time.Second
+
+// defaultMaxOutputBytes 命令输出的默认字节上限（1 MiB）。
+const defaultMaxOutputBytes = 1 * 1024 * 1024
 
 // DangerousPatterns 是内置的危险命令正则模式集合（约 40 条）。
 //
@@ -71,7 +79,9 @@ var DangerousPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bumount\b`),
 
 	// —— 重定向/覆盖类 ——
-	regexp.MustCompile(`>>?`), // > 或 >> 重定向（覆盖/追加）
+	// 匹配空白后跟 > 或 >> 的 shell 重定向操作符（如 `cmd > file` 或 `cmd >> file`）。
+	// 要求运算符前有空白，避免误匹配字符串内嵌的 > 符号（如 URL、比较表达式）。
+	regexp.MustCompile(`\s>>?`), // > 或 >> 重定向（覆盖/追加）
 	regexp.MustCompile(`\btee\b`),
 	regexp.MustCompile(`\btruncate\b`),
 
@@ -235,6 +245,9 @@ func (t *CommandTool) parseArgs(arguments string) (commandArgs, error) {
 }
 
 // fullCommandLine 将 command 与 args 拼接为完整命令行字符串（仅用于模式匹配与展示）。
+//
+// 拼接后将换行符（\n \r）规范化为空格，防止参数中嵌入换行符绕过单行危险模式正则。
+// 例如 args=["foo\nrm -rf /"] 若不规范化，"rm -rf" 出现在第二行会跳过所有无多行标志的正则。
 func fullCommandLine(args commandArgs) string {
 	var b strings.Builder
 	b.WriteString(args.Command)
@@ -242,15 +255,17 @@ func fullCommandLine(args commandArgs) string {
 		b.WriteByte(' ')
 		b.WriteString(a)
 	}
-	return b.String()
+	s := b.String()
+	// 规范化换行符，避免多行参数绕过单行正则匹配。
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	return s
 }
 
 // baseName 提取命令的基础名（去除路径），用于白名单匹配。
+// 使用 filepath.Base 以正确处理各平台路径分隔符。
 func baseName(command string) string {
-	if idx := strings.LastIndexAny(command, "/\\"); idx >= 0 {
-		return command[idx+1:]
-	}
-	return command
+	return filepath.Base(command)
 }
 
 // IsAllowed 判断命令是否在白名单内。白名单为空时视为放行。
@@ -309,16 +324,45 @@ func (t *CommandTool) Execute(ctx context.Context, arguments string) (string, er
 		cmd.Dir = t.config.WorkDir
 	}
 
-	const maxOutputBytes = 1 * 1024 * 1024 // 1 MB
-	lw := &limitedWriter{limit: maxOutputBytes}
+	// 确定输出字节上限：0 使用默认值，负数表示不限制。
+	limit := t.config.MaxOutputBytes
+	if limit == 0 {
+		limit = defaultMaxOutputBytes
+	}
+	// 采集容量：正常情况用 2× limit 以支持头尾提取；
+	// 不限制模式（limit<0）使用 64 MiB 安全兜底，防止 OOM。
+	capBytes := 64 * 1024 * 1024
+	if limit > 0 {
+		capBytes = limit * 2
+	}
+	lw := &limitedWriter{limit: capBytes}
 	cmd.Stdout = lw
 	cmd.Stderr = lw
 
 	runErr := cmd.Run()
 
-	output := lw.buf.String()
-	if lw.truncated {
-		output += fmt.Sprintf("\n[输出已截断，超过 %d 字节上限]", maxOutputBytes)
+	raw := lw.buf.Bytes()
+	var output string
+	if limit > 0 && len(raw) > limit {
+		// 超出上限：保留头尾各 50%，中间用省略标记替代。
+		half := limit / 2
+		head := raw[:half]
+		tail := raw[len(raw)-half:]
+		omitted := int64(len(raw)) - int64(half)*2
+		var marker string
+		if lw.truncated {
+			// 实际输出超过采集上限（2×limit），tail 仅为近似尾部。
+			marker = fmt.Sprintf("\n[...中间内容已省略（≥%d 字节，实际可能更多）...]\n", omitted)
+		} else {
+			marker = fmt.Sprintf("\n[...中间内容已省略约 %d 字节...]\n", omitted)
+		}
+		output = string(head) + marker + string(tail)
+	} else {
+		output = string(raw)
+		if lw.truncated {
+			// 命中了不限制模式的 64 MiB 安全上限。
+			output += fmt.Sprintf("\n[输出已截断，超过 %d 字节安全上限]", capBytes)
+		}
 	}
 
 	// 超时判定优先。

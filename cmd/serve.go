@@ -83,7 +83,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 组装并启动 Server。cmd 与 server 的工厂签名一致，直接转换类型传入。
+	// 组装并启动 Server。cmd.AgentFactory 与 server.AgentFactory 签名一致，直接转换类型传入。
 	srv := server.NewServer(cfg, server.AgentFactory(agentFactory), st)
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	return srv.Start(addr)

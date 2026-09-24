@@ -121,7 +121,8 @@ func (b *baseProvider) doWithRetry(ctx context.Context, url string, payload []by
 		resp, err := b.httpClient.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				// 保留网络错误细节，同时包装 context 错误以便调用方用 errors.Is 判断取消/超时。
+				return nil, fmt.Errorf("%s: 请求被中断（%w）: %v", b.name, ctx.Err(), err)
 			}
 			lastErr = fmt.Errorf("%s: 请求发送失败: %w", b.name, err)
 			continue
@@ -411,6 +412,25 @@ func streamOpenAICompat(ctx context.Context, resp *http.Response, out chan<- Str
 	}, func(err error) {
 		sendResponse(ctx, out, StreamResponse{Err: fmt.Errorf("%s: 读取流失败: %w", cfg.providerName, err)})
 	})
+}
+
+// buildOpenAICompatRequest 构造 OpenAI 兼容格式请求体的公共部分，
+// 供 openAIProvider / deepSeekProvider / arkProvider 等复用，消除重复代码。
+//
+// 调用方在返回前可按需调整字段（如推理模型置空 Temperature / TopP，
+// 或将 MaxTokens 替换为 MaxCompletionTokens）。
+func buildOpenAICompatRequest(model string, messages []Message, tools []ToolDef, o options) chatRequest {
+	return chatRequest{
+		Model:       model,
+		Messages:    convertMessages(messages),
+		Tools:       convertTools(tools),
+		Stream:      true,
+		StreamOpts:  &streamOpts{IncludeUsage: true},
+		Temperature: o.Temperature,
+		MaxTokens:   o.MaxTokens,
+		TopP:        o.TopP,
+		Stop:        o.Stop,
+	}
 }
 
 // parseAPIError 尝试从错误响应体中提取可读的错误信息。

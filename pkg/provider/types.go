@@ -111,6 +111,10 @@ type ProviderConfig struct {
 	Model string
 	// ExtraHeaders 额外的自定义请求头。
 	ExtraHeaders map[string]string
+	// IsReasoner 显式声明该模型为推理模型（如 deepseek-reasoner、o1 等）。
+	// 推理模型通常不支持 temperature/top_p，且可能使用不同的 max_tokens 字段名。
+	// 若为 false，Provider 会根据模型名做启发式判断（如检查名称是否包含 "reasoner"）。
+	IsReasoner bool
 }
 
 // Provider 是各 LLM 供应商的统一抽象接口。

@@ -13,7 +13,7 @@ const (
 	// defaultOpenAIBaseURL OpenAI 官方 API 的默认基础地址。
 	defaultOpenAIBaseURL = "https://api.openai.com/v1"
 	// defaultModel 未在配置中指定模型时使用的兜底模型名。
-	defaultModel = "gpt-3.5-turbo"
+	defaultModel = "gpt-4o-mini"
 )
 
 // openAIProvider 是基于 OpenAI Chat Completions API 的供应商实现。
@@ -23,6 +23,9 @@ const (
 // 仅需在配置中指定不同的 BaseURL 与 Model。
 type openAIProvider struct {
 	baseProvider
+	// isReasoner 由配置中 ModelConfig.Reasoner=true 显式设置；为 true 时强制视为推理模型，
+	// 不再依赖模型名前缀的启发式判断，避免非 o1/o3/o4 前缀的推理模型（如自托管）被遗漏。
+	isReasoner bool
 }
 
 // NewOpenAIProvider 根据配置创建一个 OpenAI 兼容的 Provider。
@@ -54,6 +57,7 @@ func NewOpenAIProvider(cfg ProviderConfig) (Provider, error) {
 			extraHeaders: cfg.ExtraHeaders,
 			httpClient:   newHTTPClient(),
 		},
+		isReasoner: cfg.IsReasoner,
 	}, nil
 }
 
@@ -65,9 +69,22 @@ type chatRequest struct {
 	Stream      bool          `json:"stream"`
 	StreamOpts  *streamOpts   `json:"stream_options,omitempty"`
 	Temperature *float64      `json:"temperature,omitempty"`
-	MaxTokens   *int          `json:"max_tokens,omitempty"`
-	TopP        *float64      `json:"top_p,omitempty"`
-	Stop        []string      `json:"stop,omitempty"`
+	// MaxTokens 用于传统 OpenAI 模型（GPT 系列）。
+	MaxTokens *int `json:"max_tokens,omitempty"`
+	// MaxCompletionTokens 用于 OpenAI o 系列模型（o1/o3/o4 等），
+	// 这些模型已废弃 max_tokens 字段，改用 max_completion_tokens。
+	MaxCompletionTokens *int     `json:"max_completion_tokens,omitempty"`
+	TopP                *float64 `json:"top_p,omitempty"`
+	Stop                []string `json:"stop,omitempty"`
+}
+
+// isReasoningModel 判断是否为 OpenAI o 系列推理模型。
+// o 系列（o1/o3/o4 及其变种）使用 max_completion_tokens 而非 max_tokens，
+// 且不支持 temperature 等部分参数。
+func isReasoningModel(model string) bool {
+	return strings.HasPrefix(model, "o1") ||
+		strings.HasPrefix(model, "o3") ||
+		strings.HasPrefix(model, "o4")
 }
 
 // streamOpts 控制流式响应的附加选项。
@@ -136,17 +153,16 @@ func (p *openAIProvider) Chat(ctx context.Context, messages []Message, tools []T
 	// 组合生成参数。
 	o := applyOptions(opts...)
 
-	// 构造请求体。
-	reqBody := chatRequest{
-		Model:       p.model,
-		Messages:    convertMessages(messages),
-		Tools:       convertTools(tools),
-		Stream:      true,
-		StreamOpts:  &streamOpts{IncludeUsage: true},
-		Temperature: o.Temperature,
-		MaxTokens:   o.MaxTokens,
-		TopP:        o.TopP,
-		Stop:        o.Stop,
+	// 构造请求体（公共部分）。
+	reqBody := buildOpenAICompatRequest(p.model, messages, tools, o)
+	// 推理模型：Temperature 不支持，MaxTokens 改用 MaxCompletionTokens。
+	// 优先尊重配置中的显式声明（p.isReasoner），再做模型名启发式判断。
+	if p.isReasoner || isReasoningModel(p.model) {
+		reqBody.Temperature = nil
+		if o.MaxTokens != nil {
+			reqBody.MaxTokens = nil
+			reqBody.MaxCompletionTokens = o.MaxTokens
+		}
 	}
 
 	payload, err := json.Marshal(reqBody)
