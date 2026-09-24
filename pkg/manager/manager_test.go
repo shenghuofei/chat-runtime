@@ -67,11 +67,11 @@ func TestTruncateOverflow(t *testing.T) {
 // TestWindowOverflow 验证 window 模式：token 用量超过阈值时丢弃早期轮次。
 func TestWindowOverflow(t *testing.T) {
 	// MaxTokens=1000，CompressRatio=0.8，阈值=800。
-	m := New(ManagerConfig{Mode: ModeWindow, MaxTokens: 1000, CompressRatio: 0.8})
+	m := New(ManagerConfig{Mode: ModeWindow, MaxTokens: 100, CompressRatio: 0.8})
 
 	for i := 0; i < 10; i++ {
-		m.AddUserMessage(provider.Message{Content: "问题"})
-		m.AddAssistantMessage(provider.Message{Content: "回答"})
+		m.AddUserMessage(provider.Message{Content: "这是一段比较长的用户问题内容，用来让估算 token 数超过阈值触发 window 裁剪"})
+		m.AddAssistantMessage(provider.Message{Content: "这是一段比较长的助手回答内容，用来让估算 token 数超过阈值触发 window 裁剪"})
 	}
 
 	before := m.RoundCount()
@@ -79,7 +79,7 @@ func TestWindowOverflow(t *testing.T) {
 		t.Fatalf("上报前期望 10 轮，实际 %d 轮", before)
 	}
 
-	// 上报超过阈值的用量，应触发窗口丢弃。
+	// 上报用量（具体值不再影响裁剪决策，裁剪完全基于 estimateTokens 估算）。
 	m.ReportUsage(provider.TokenUsage{TotalTokens: 1000})
 
 	after := m.RoundCount()
@@ -120,6 +120,10 @@ func TestCompressOverflow(t *testing.T) {
 		m.AddUserMessage(provider.Message{Content: "u"})
 		m.AddAssistantMessage(provider.Message{Content: "a"})
 	}
+
+	// compress 模式下，追加消息仅置位「待压缩」标记，真正的摘要（网络 IO）
+	// 由 CompressIfNeeded 在锁外执行，避免持写锁做网络请求。
+	m.CompressIfNeeded()
 
 	msgs := m.GetMessages()
 	if !called {

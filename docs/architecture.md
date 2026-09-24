@@ -2,7 +2,7 @@
 
 本文档描述 chat-runtime 的整体架构、数据流、上下文管理策略、Prompt Cache 优化、会话生命周期以及安全设计。
 
-chat-runtime 是一个基于 Go 的 LLM Agent 运行时框架，底层采用 [eino](https://github.com/cloudwego/eino)（CloudWeGo）作为 Agent 编排框架，支持多种 LLM Provider、MCP 协议工具集成、三种上下文溢出策略、会话持久化、CLI + WebSocket 双模式，并以单一二进制（内嵌前端）方式部署。
+chat-runtime 是一个基于 Go 的 LLM Agent 运行时框架，采用自研的 Agent 编排层（不依赖任何三方编排框架），支持多种 LLM Provider、MCP 协议工具集成、三种上下文溢出策略、会话持久化、CLI + WebSocket 双模式，并以单一二进制（内嵌前端）方式部署。
 
 ---
 
@@ -23,7 +23,7 @@ chat-runtime 采用清晰的分层架构，自上而下依次为 **Transport 层
 │                          Agent 层                           │
 │   ┌────────────┐   ┌──────────────────┐   ┌─────────────┐   │
 │   │  Session   │   │  Tool Calling    │   │  Approval   │   │
-│   │  会话管理   │──▶│  循环编排（eino）  │──▶│  审批流      │   │
+│   │  会话管理   │──▶│  循环编排         │──▶│  审批流      │   │
 │   └────────────┘   └──────────────────┘   └─────────────┘   │
 └────────┬─────────────────┬──────────────────────┬──────────┘
          │                 │                      │
@@ -51,7 +51,7 @@ Transport 层负责与外部世界交互，将不同接入方式统一为标准�
 
 ### 1.2 Agent 层
 
-Agent 层是整个运行时的编排核心，底层复用 eino 的 Agent 能力，主要包含三个子模块：
+Agent 层是整个运行时的编排核心，为自研 Agent 编排（由 agent.Run 主循环编排），主要包含三个子模块：
 
 - **Session（会话管理）**：维护单次会话的消息历史、上下文状态、关联的模型与工具集，负责与 Store 层交互进行持久化与恢复。
 - **Tool Calling 循环**：驱动"LLM 调用 → 解析 tool_calls → 执行工具 → 回填结果 → 再次调用 LLM"的多轮循环，直到模型返回不含工具调用的终止响应。
@@ -323,5 +323,5 @@ MCP Server 与工具可通过 `auto_approve` 声明审批策略，支持三种�
 
 - 配置详解：[configuration.md](configuration.md)
 - MCP 集成指南：[mcp.md](mcp.md)
-- 底层 Agent 框架：[eino (CloudWeGo)](https://github.com/cloudwego/eino)
+- 底层 Agent 编排：自研 Agent 编排层（由 agent.Run 主循环编排，不依赖三方编排框架）
 - MCP 协议：[Model Context Protocol](https://modelcontextprotocol.io/)

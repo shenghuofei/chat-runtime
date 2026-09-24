@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -100,8 +100,8 @@ type WSApprovalHandler struct {
 	send ApprovalSender
 	// timeout 等待前端响应的超时（<=0 表示不超时，仅受 ctx 约束）。
 	timeout time.Duration
-	// logger 用于记录晚到/无效的审批响应，nil 时退化为 log.Default()。
-	logger *log.Logger
+	// logger 用于记录晚到/无效的审批响应。
+	logger *slog.Logger
 
 	mu      sync.Mutex
 	pending map[string]chan bool
@@ -114,7 +114,7 @@ func NewWSApprovalHandler(send ApprovalSender, timeout time.Duration) *WSApprova
 	return &WSApprovalHandler{
 		send:    send,
 		timeout: timeout,
-		logger:  log.Default(),
+		logger:  slog.Default(),
 		pending: make(map[string]chan bool),
 	}
 }
@@ -169,7 +169,7 @@ func (h *WSApprovalHandler) Resolve(id string, approved bool) {
 	h.mu.Unlock()
 	if !ok {
 		// 超时后收到的晚到响应，记录以便排查审批流程问题。
-		h.logger.Printf("[审批] 收到未知或已超时的审批 ID %q 的响应（已忽略）", id)
+		h.logger.Warn("收到未知或已超时的审批响应，已忽略", "approval_id", id)
 		return
 	}
 	// 非阻塞写入（channel 缓冲为 1）。
@@ -177,7 +177,7 @@ func (h *WSApprovalHandler) Resolve(id string, approved bool) {
 	case ch <- approved:
 	default:
 		// channel 已满说明被重复 Resolve，记录异常。
-		h.logger.Printf("[审批] 审批 ID %q 收到重复响应（已忽略）", id)
+		h.logger.Warn("审批收到重复响应，已忽略", "approval_id", id)
 	}
 }
 

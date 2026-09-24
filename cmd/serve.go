@@ -3,9 +3,11 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/shenghuofei/chat-runtime/pkg/config"
 	"github.com/shenghuofei/chat-runtime/pkg/server"
+	"github.com/shenghuofei/chat-runtime/pkg/store"
 	"github.com/spf13/cobra"
 )
 
@@ -71,8 +73,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return errors.New("AgentFactory 未初始化：请在启动时调用 cmd.SetAgentFactory 注册装配实现")
 	}
 
+	// 获取全局 Store 供 Server 的会话管理 API 使用。
+	var st store.Store
+	if storeGetter != nil {
+		if s, err := storeGetter(); err != nil {
+			slog.Warn("Store 初始化失败，会话管理 API 不可用", "error", err)
+		} else {
+			st = s
+		}
+	}
+
 	// 组装并启动 Server。cmd 与 server 的工厂签名一致，直接转换类型传入。
-	srv := server.NewServer(cfg, server.AgentFactory(agentFactory))
+	srv := server.NewServer(cfg, server.AgentFactory(agentFactory), st)
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	return srv.Start(addr)
 }

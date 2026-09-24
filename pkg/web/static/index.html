@@ -16,6 +16,7 @@
       --bg: #1a1b1e;
       --bg-elevated: #25262b;
       --bg-input: #2c2e33;
+      --bg-code: #16171a;
       --border: #373a40;
       --text: #e9ecef;
       --text-dim: #909296;
@@ -26,12 +27,25 @@
       --danger: #ff6b6b;
       --success: #51cf66;
       --warning: #ffd43b;
-      --think-bg: #1e2a1e;
-      --think-border: #3a5a3a;
-      --think-text: #8fbc8f;
+
+      /* 各类型块的语义色 */
+      --think-bg: #172519;
+      --think-border: #3fae5a;
+      --think-text: #8fdba0;
+      --tool-bg: #241f14;
+      --tool-border: #e6a23c;
+      --tool-text: #f2c76b;
+      --tool-result-bg: #1c1d20;
+      --tool-result-border: #4a4d52;
+      --tool-result-text: #b8bcc2;
+      --approval-bg: #2a1d12;
+      --approval-border: #ff922b;
+      --approval-text: #ffb066;
+
       --radius: 12px;
       --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
               "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+      --mono: "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -43,27 +57,28 @@
 
     /* ===== 顶部栏 ===== */
     header {
-      display: flex; align-items: center; justify-content: space-between;
+      display: flex; align-items: center; gap: 16px;
       padding: 12px 20px; background: var(--bg-elevated);
       border-bottom: 1px solid var(--border); flex-shrink: 0;
     }
     header .title { font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
     header .status { font-size: 12px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
-    header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); }
-    header .dot.online { background: var(--success); }
+    header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); transition: background .2s; }
+    header .dot.online { background: var(--success); box-shadow: 0 0 6px var(--success); }
     header .dot.offline { background: var(--danger); }
+    header .spacer { flex: 1; }
     header .actions { display: flex; gap: 8px; }
     header select {
       background: var(--bg-input); color: var(--text);
       border: 1px solid var(--border); border-radius: 6px;
-      padding: 4px 8px; font-size: 13px; font-family: var(--font);
+      padding: 5px 10px; font-size: 13px; font-family: var(--font);
       cursor: pointer; outline: none;
     }
     header select:hover { border-color: var(--text-dim); }
 
     /* ===== 主体消息区 ===== */
     main { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; align-items: center; }
-    .messages { width: 100%; max-width: 820px; display: flex; flex-direction: column; gap: 18px; }
+    .messages { width: 100%; max-width: 860px; display: flex; flex-direction: column; gap: 18px; }
 
     .msg { display: flex; gap: 12px; animation: fade 0.2s ease; }
     @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -91,7 +106,8 @@
     }
     .msg.user .bubble { background: var(--user-bubble); border-color: transparent; }
 
-    /* Markdown 内容 */
+    /* 正文 Markdown 内容（白色调） */
+    .md-content { border-left: 3px solid transparent; }
     .bubble p { margin: 6px 0; }
     .bubble p:first-child { margin-top: 0; }
     .bubble p:last-child { margin-bottom: 0; }
@@ -100,92 +116,101 @@
     .bubble table { border-collapse: collapse; margin: 8px 0; }
     .bubble th, .bubble td { border: 1px solid var(--border); padding: 6px 10px; }
     .bubble blockquote { border-left: 3px solid var(--accent); padding-left: 12px; color: var(--text-dim); margin: 8px 0; }
+    .bubble h1, .bubble h2, .bubble h3 { margin: 12px 0 6px; line-height: 1.3; }
 
-    /* ===== 代码块 + 复制按钮 ===== */
-    .bubble .code-block {
-      position: relative; margin: 8px 0;
+    /* ===== 通用可折叠块（thinking / tool 共用外观骨架）===== */
+    details.block { border-radius: 8px; margin: 10px 0; overflow: hidden; border: 1px solid var(--border); border-left-width: 3px; }
+    details.block > summary {
+      cursor: pointer; padding: 9px 12px; font-size: 13px; font-weight: 500;
+      display: flex; align-items: center; gap: 8px; list-style: none; user-select: none;
     }
-    .bubble .code-block .code-header {
-      display: flex; align-items: center; justify-content: space-between;
-      background: #16171a; border-radius: 8px 8px 0 0;
-      padding: 6px 12px; font-size: 12px; color: var(--text-dim);
+    details.block > summary::-webkit-details-marker { display: none; }
+    /* 展开/收起箭头指示器 */
+    details.block > summary .arrow {
+      display: inline-block; transition: transform .18s ease; font-size: 10px; color: currentColor; opacity: .8;
     }
-    .bubble .code-block .code-header .lang { text-transform: uppercase; font-weight: 500; }
-    .bubble .code-block .copy-btn {
-      background: transparent; border: 1px solid var(--border); color: var(--text-dim);
-      border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer;
-      transition: all 0.15s;
-    }
-    .bubble .code-block .copy-btn:hover { color: var(--text); border-color: var(--text-dim); }
-    .bubble .code-block .copy-btn.copied { color: var(--success); border-color: var(--success); }
-    .bubble .code-block pre {
-      background: #16171a; border-radius: 0 0 8px 8px; padding: 12px;
-      overflow-x: auto; font-size: 13px; margin: 0;
-    }
-    .bubble .code-block pre code {
-      font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
-    }
-    /* 非代码块内的行内 code */
-    .bubble :not(pre) > code {
-      background: #16171a; padding: 2px 6px; border-radius: 4px;
-      font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
-    }
+    details.block[open] > summary .arrow { transform: rotate(90deg); }
+    details.block > summary .icon { font-size: 14px; line-height: 1; }
+    details.block > summary .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    details.block > summary .meta-right { font-size: 11px; color: var(--text-dim); font-weight: 400; flex-shrink: 0; }
 
-    /* ===== Thinking 折叠块（DeepSeek/Ark 思维链）===== */
-    .thinking-block {
-      border: 1px solid var(--think-border); border-radius: 8px;
-      margin: 8px 0; background: var(--think-bg); overflow: hidden;
-    }
-    .thinking-block summary {
-      cursor: pointer; padding: 8px 12px; font-size: 13px;
-      display: flex; align-items: center; gap: 6px;
-      color: var(--think-text); list-style: none; user-select: none;
-    }
-    .thinking-block summary::-webkit-details-marker { display: none; }
-    .thinking-block summary::before { content: "💭"; }
-    .thinking-block summary .duration {
-      margin-left: auto; font-size: 11px; color: var(--text-dim);
-    }
+    /* ===== Thinking 折叠块（绿色调，💭）===== */
+    .thinking-block { border-color: var(--think-border); background: var(--think-bg); }
+    .thinking-block > summary { color: var(--think-text); }
     .thinking-block .thinking-content {
-      padding: 0 12px 10px; font-size: 13px; color: var(--think-text);
+      padding: 4px 12px 10px 32px; font-size: 13px; color: var(--think-text);
       line-height: 1.6; white-space: pre-wrap; word-break: break-word;
-      max-height: 300px; overflow-y: auto;
+      max-height: 320px; overflow-y: auto;
+    }
+
+    /* ===== 工具调用折叠块（黄/橙色调，🔧）===== */
+    .tool-block { border-color: var(--tool-border); background: var(--tool-bg); }
+    .tool-block > summary { color: var(--tool-text); }
+    .tool-block .tool-body { padding: 2px 12px 12px 32px; font-size: 12px; }
+    .tool-block .section-label {
+      color: var(--text-dim); font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .04em; margin: 10px 0 4px; display: flex; align-items: center; gap: 6px;
+    }
+    .tool-block .section-label::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--tool-border); }
+    .tool-block pre.args {
+      background: var(--bg-code); padding: 10px; border-radius: 6px;
+      white-space: pre-wrap; word-break: break-all; margin: 0;
+      font-family: var(--mono); font-size: 12px; line-height: 1.5;
+      border: 1px solid var(--border);
+    }
+
+    /* ===== 工具结果块（嵌套，灰色调）===== */
+    .tool-block .tool-result {
+      background: var(--tool-result-bg); border: 1px solid var(--tool-result-border);
+      border-left: 3px solid var(--tool-result-border); border-radius: 6px;
+      padding: 10px; margin: 0; color: var(--tool-result-text);
+      white-space: pre-wrap; word-break: break-all;
+      font-family: var(--mono); font-size: 12px; line-height: 1.5;
+      max-height: 360px; overflow: auto;
+    }
+    .tool-block .result-section[hidden] { display: none; }
+    .tool-block .result-label::before { background: var(--tool-result-border); }
+
+    /* ===== 审批块（橙色警告调，⚠️）===== */
+    .approval {
+      border: 1px solid var(--approval-border); border-left: 3px solid var(--approval-border);
+      border-radius: 8px; margin: 10px 0; padding: 12px 14px; background: var(--approval-bg);
+    }
+    .approval .head { color: var(--approval-text); font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+    .approval .section-label {
+      color: var(--text-dim); font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .04em; margin: 8px 0 4px;
+    }
+    .approval pre {
+      background: var(--bg-code); padding: 10px; border-radius: 6px; border: 1px solid var(--border);
+      font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-all; margin: 0;
+    }
+    .approval .btns { display: flex; gap: 10px; margin-top: 12px; }
+
+    /* ===== 代码块 + 复制按钮 + 语言标签 ===== */
+    .code-block { position: relative; margin: 10px 0; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+    .code-block .code-header {
+      display: flex; align-items: center; justify-content: space-between;
+      background: #101114; padding: 6px 12px; font-size: 12px; color: var(--text-dim);
+    }
+    .code-block .code-header .lang { text-transform: uppercase; font-weight: 600; letter-spacing: .05em; font-size: 11px; }
+    .code-block .copy-btn {
+      background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+      border-radius: 4px; padding: 2px 10px; font-size: 11px; cursor: pointer; transition: all .15s;
+    }
+    .code-block .copy-btn:hover { color: var(--text); border-color: var(--text-dim); }
+    .code-block .copy-btn.copied { color: var(--success); border-color: var(--success); }
+    .code-block pre { background: var(--bg-code); padding: 12px; overflow-x: auto; font-size: 13px; margin: 0; }
+    .code-block pre code { font-family: var(--mono); font-size: 13px; }
+    /* 行内 code */
+    .bubble :not(pre) > code {
+      background: var(--bg-code); padding: 2px 6px; border-radius: 4px;
+      font-family: var(--mono); font-size: 13px;
     }
 
     /* 流式光标 */
-    .cursor::after { content: "▋"; color: var(--accent); animation: blink 1s steps(2) infinite; }
+    .cursor::after { content: "▋"; color: var(--accent); animation: blink 1s steps(2) infinite; margin-left: 1px; }
     @keyframes blink { 50% { opacity: 0; } }
-
-    /* ===== 工具调用 ===== */
-    .tool {
-      border: 1px solid var(--border); border-radius: 8px;
-      margin: 8px 0; background: #1f2023; overflow: hidden;
-    }
-    .tool summary {
-      cursor: pointer; padding: 8px 12px; font-size: 13px;
-      display: flex; align-items: center; gap: 8px;
-      color: var(--warning); list-style: none; user-select: none;
-    }
-    .tool summary::-webkit-details-marker { display: none; }
-    .tool summary::before { content: "🔧"; }
-    .tool .tool-body { padding: 0 12px 10px; font-size: 12px; }
-    .tool .tool-body pre {
-      background: #16171a; padding: 8px; border-radius: 6px;
-      white-space: pre-wrap; word-break: break-all; margin: 4px 0;
-    }
-    .tool .label { color: var(--text-dim); margin-top: 6px; }
-
-    /* ===== 审批 ===== */
-    .approval {
-      border: 1px solid var(--warning); border-radius: 8px; margin: 8px 0; padding: 12px;
-      background: rgba(255, 212, 59, 0.08);
-    }
-    .approval .head { color: var(--warning); font-weight: 600; margin-bottom: 8px; }
-    .approval pre {
-      background: #16171a; padding: 8px; border-radius: 6px;
-      font-size: 12px; white-space: pre-wrap; word-break: break-all; margin: 6px 0;
-    }
-    .approval .btns { display: flex; gap: 10px; margin-top: 10px; }
 
     /* ===== 底部输入区 ===== */
     footer {
@@ -193,10 +218,11 @@
       background: var(--bg); display: flex; justify-content: center;
     }
     .composer {
-      width: 100%; max-width: 820px; display: flex; gap: 10px; align-items: flex-end;
+      width: 100%; max-width: 860px; display: flex; gap: 10px; align-items: flex-end;
       background: var(--bg-input); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 8px 8px 8px 14px;
     }
+    .composer:focus-within { border-color: var(--accent); }
     .composer textarea {
       flex: 1; resize: none; border: none; outline: none;
       background: transparent; color: var(--text);
@@ -209,7 +235,7 @@
     button {
       font-family: var(--font); cursor: pointer; border: none; border-radius: 8px;
       padding: 8px 14px; font-size: 14px; font-weight: 500;
-      transition: background 0.15s, opacity 0.15s;
+      transition: background 0.15s, opacity 0.15s, border-color .15s, color .15s;
     }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-primary { background: var(--accent); color: #fff; }
@@ -222,7 +248,7 @@
     .hint { font-size: 11px; color: var(--text-dim); text-align: center; margin-top: 8px; }
 
     @media (max-width: 640px) {
-      header { padding: 10px 14px; }
+      header { padding: 10px 14px; gap: 10px; }
       main { padding: 14px; }
       footer { padding: 10px 14px 16px; }
       .msg .avatar { width: 28px; height: 28px; }
@@ -240,6 +266,7 @@
       <span class="dot" id="statusDot"></span>
       <span id="statusText">连接中…</span>
     </div>
+    <div class="spacer"></div>
     <div class="actions">
       <button class="btn-ghost" id="newBtn" title="开启新对话">✚ <span>新对话</span></button>
       <button class="btn-danger" id="stopBtn" disabled title="停止生成">⏹ <span>停止</span></button>
@@ -252,7 +279,7 @@
   </main>
 
   <footer>
-    <div style="width:100%;max-width:820px;">
+    <div style="width:100%;max-width:860px;">
       <div class="composer">
         <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行…"></textarea>
         <button class="btn-primary send-btn" id="sendBtn" title="发送">➤</button>
@@ -280,8 +307,8 @@
     let ws = null;
     let reconnectDelay = 1000;
     let generating = false;
-    let currentBubble = null;
-    let currentRaw = '';
+    let currentBubble = null;   // 当前 assistant bubble 元素
+    let currentRaw = '';        // 当前正文（非 thinking）累积原文
 
     // 每个 chat 预设使用独立的 sessionId（key: cr_session_<chatName>），
     // 切换预设时自动切换到对应会话历史。
@@ -375,12 +402,12 @@
     // ============================================================
     function handleServerMessage(msg) {
       switch (msg.type) {
-        case 'token':    appendToken(msg.content || ''); break;
-        case 'tool_call': renderToolCall(msg.name, msg.args); break;
-        case 'tool_result': renderToolResult(msg.name, msg.result); break;
-        case 'approval': renderApproval(msg.approval_id, msg.name, msg.args); break;
-        case 'done':     finishGenerating(msg.usage); break;
-        case 'error':    renderError(msg.content || msg.message || '未知错误'); finishGenerating(); break;
+        case 'token':       appendToken(msg.content || ''); break;
+        case 'tool_call':   renderToolCall(msg.name, msg.args, msg.call_id); break;
+        case 'tool_result': renderToolResult(msg.name, msg.result, msg.call_id); break;
+        case 'approval':    renderApproval(msg.approval_id, msg.name, msg.args); break;
+        case 'done':        finishGenerating(msg.usage); break;
+        case 'error':       renderError(msg.content || msg.message || '未知错误'); finishGenerating(); break;
       }
     }
 
@@ -393,7 +420,7 @@
     let inThinking = false;       // 当前是否在 thinking 块内
     let thinkingEl = null;        // 当前 thinking 的 details 元素
     let thinkingContent = '';     // thinking 累积文本
-    let thinkingStartTime = 0;   // thinking 开始时间（用于计时）
+    let thinkingStartTime = 0;    // thinking 开始时间（用于计时）
 
     function processThinkTags(text) {
       // 将流式 token 中的 <think> 和 </think> 标签分离处理
@@ -461,13 +488,18 @@
           case 'think_open':
             thinkingStartTime = Date.now();
             thinkingContent = '';
-            // 创建 thinking 折叠块
+            // 创建 thinking 折叠块（绿色调，💭，流式时展开）
             thinkingEl = document.createElement('details');
-            thinkingEl.className = 'thinking-block';
-            thinkingEl.open = true; // 流式时展开
-            thinkingEl.innerHTML = `
-              <summary>思考中…<span class="duration"></span></summary>
-              <div class="thinking-content"></div>`;
+            thinkingEl.className = 'block thinking-block';
+            thinkingEl.open = true;
+            thinkingEl.innerHTML =
+              '<summary>' +
+                '<span class="arrow">▶</span>' +
+                '<span class="icon">💭</span>' +
+                '<span class="title">思考中…</span>' +
+                '<span class="meta-right"></span>' +
+              '</summary>' +
+              '<div class="thinking-content"></div>';
             currentBubble.appendChild(thinkingEl);
             break;
 
@@ -475,15 +507,18 @@
             if (thinkingEl) {
               thinkingContent += part.content;
               thinkingEl.querySelector('.thinking-content').textContent = thinkingContent;
+              // 自动滚动 thinking 内容到底部
+              const tc = thinkingEl.querySelector('.thinking-content');
+              tc.scrollTop = tc.scrollHeight;
             }
             break;
 
           case 'think_close':
             if (thinkingEl) {
               const duration = ((Date.now() - thinkingStartTime) / 1000).toFixed(1);
-              thinkingEl.querySelector('summary').innerHTML =
-                `已思考 <span class="duration">${duration}s</span>`;
-              thinkingEl.open = false; // 结束后折叠
+              thinkingEl.querySelector('.title').textContent = '已思考';
+              thinkingEl.querySelector('.meta-right').textContent = duration + 's';
+              thinkingEl.open = false; // 结束后自动折叠
               thinkingEl = null;
             }
             break;
@@ -491,7 +526,6 @@
           case 'text':
             if (part.content) {
               currentRaw += part.content;
-              // 重新渲染非 thinking 部分的 markdown
               renderBubbleContent();
             }
             break;
@@ -502,7 +536,7 @@
       scrollToBottom();
     }
 
-    // 渲染 bubble 中的 markdown 内容（保留 thinking/tool 等已插入的子元素）
+    // 渲染 bubble 中的 markdown 正文（保留 thinking/tool 等已插入的子元素）
     function renderBubbleContent() {
       if (!currentBubble) return;
 
@@ -511,13 +545,11 @@
       if (!mdContainer) {
         mdContainer = document.createElement('div');
         mdContainer.className = 'md-content';
-        // 插入到 thinking 块之后
-        const lastThinking = currentBubble.querySelector('.thinking-block:last-of-type');
-        if (lastThinking) {
-          lastThinking.after(mdContainer);
-        } else {
-          currentBubble.prepend(mdContainer);
-        }
+        // 插入到最后一个 thinking 块之后
+        const thinkings = currentBubble.querySelectorAll('.thinking-block');
+        const lastThinking = thinkings.length ? thinkings[thinkings.length - 1] : null;
+        if (lastThinking) lastThinking.after(mdContainer);
+        else currentBubble.prepend(mdContainer);
       }
 
       mdContainer.innerHTML = renderMarkdown(currentRaw);
@@ -525,9 +557,8 @@
       highlightIn(mdContainer);
     }
 
-    // ===== 代码块复制按钮 =====
+    // ===== 代码块复制按钮 + 语言标签 =====
     function addCopyButtons(container) {
-      // 找到所有 <pre><code> 并包装成带 header 的 code-block
       container.querySelectorAll('pre:not(.wrapped)').forEach(pre => {
         pre.classList.add('wrapped');
         const code = pre.querySelector('code');
@@ -537,7 +568,6 @@
         const langClass = Array.from(code.classList).find(c => c.startsWith('language-'));
         const lang = langClass ? langClass.replace('language-', '') : '';
 
-        // 包装
         const wrapper = document.createElement('div');
         wrapper.className = 'code-block';
 
@@ -550,24 +580,16 @@
         copyBtn.textContent = '复制';
         copyBtn.onclick = () => {
           const text = code.textContent;
-          navigator.clipboard.writeText(text).then(() => {
-            copyBtn.textContent = '已复制 ✓';
-            copyBtn.classList.add('copied');
-            setTimeout(() => {
-              copyBtn.textContent = '复制';
-              copyBtn.classList.remove('copied');
-            }, 2000);
-          }).catch(() => {
-            // fallback
-            const ta = document.createElement('textarea');
-            ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
-            document.body.appendChild(ta); ta.select();
-            document.execCommand('copy');
-            document.body.removeChild(ta);
+          const done = () => {
             copyBtn.textContent = '已复制 ✓';
             copyBtn.classList.add('copied');
             setTimeout(() => { copyBtn.textContent = '复制'; copyBtn.classList.remove('copied'); }, 2000);
-          });
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+          } else {
+            fallbackCopy(text, done);
+          }
         };
         header.appendChild(copyBtn);
 
@@ -577,50 +599,96 @@
       });
     }
 
-    // 工具调用
-    function renderToolCall(name, args) {
+    function fallbackCopy(text, done) {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch (_) {}
+      document.body.removeChild(ta);
+      done();
+    }
+
+    // ===== 工具调用块（黄/橙色调，🔧，可折叠，含参数/结果区）=====
+    function renderToolCall(name, args, callId) {
       const details = document.createElement('details');
-      details.className = 'tool';
+      details.className = 'block tool-block';
       details.open = false;
-      details.innerHTML = `
-        <summary>调用工具：${escapeHtml(name)}</summary>
-        <div class="tool-body">
-          <div class="label">参数：</div>
-          <pre>${escapeHtml(pretty(args))}</pre>
-          <div class="label result-label" style="display:none;">结果：</div>
-          <pre class="result" style="display:none;"></pre>
-        </div>`;
       details.dataset.tool = name;
+      details.dataset.callId = callId || '';
+      details.innerHTML =
+        '<summary>' +
+          '<span class="arrow">▶</span>' +
+          '<span class="icon">🔧</span>' +
+          '<span class="title">调用工具：' + escapeHtml(name) + '</span>' +
+          '<span class="meta-right">运行中…</span>' +
+        '</summary>' +
+        '<div class="tool-body">' +
+          '<div class="section-label">参数</div>' +
+          '<pre class="args">' + escapeHtml(pretty(args)) + '</pre>' +
+          '<div class="result-section" hidden>' +
+            '<div class="section-label result-label">结果</div>' +
+            '<pre class="tool-result"></pre>' +
+          '</div>' +
+        '</div>';
       appendBlock(details);
     }
 
-    function renderToolResult(name, result) {
-      const blocks = $messages.querySelectorAll(`.tool[data-tool="${cssEscape(name)}"]`);
+    // ===== 工具结果块（嵌套在工具调用块内部，灰色调）=====
+    function renderToolResult(name, result, callId) {
+      // 填充目标块的结果区。
+      const fill = (b) => {
+        const resultPre = b.querySelector('.tool-result');
+        if (!resultPre) return false;
+        resultPre.textContent = typeof result === 'string' ? result : pretty(result);
+        b.querySelector('.result-section').hidden = false;
+        resultPre.dataset.filled = '1';
+        const mr = b.querySelector('.meta-right');
+        if (mr) mr.textContent = '已完成';
+        return true;
+      };
+
+      // 优先按 call ID 精确匹配，避免同名工具并发时错位。
+      if (callId) {
+        const block = $messages.querySelector(`.tool-block[data-call-id="${cssEscape(callId)}"]`);
+        if (block) {
+          fill(block);
+          scrollToBottom();
+          return;
+        }
+      }
+
+      // 回退：按名称查找最后一个尚未填充的调用块。
+      const blocks = $messages.querySelectorAll(`.tool-block[data-tool="${cssEscape(name)}"]`);
       for (let i = blocks.length - 1; i >= 0; i--) {
         const b = blocks[i];
-        const resultPre = b.querySelector('.result');
+        const resultPre = b.querySelector('.tool-result');
         if (resultPre && !resultPre.dataset.filled) {
-          resultPre.textContent = typeof result === 'string' ? result : pretty(result);
-          resultPre.style.display = 'block';
-          b.querySelector('.result-label').style.display = 'block';
-          resultPre.dataset.filled = '1';
+          fill(b);
           break;
         }
       }
       scrollToBottom();
     }
 
+    // ===== 审批块（橙色警告调，⚠️，批准/拒绝按钮）=====
+    // activeApprovalId 跟踪当前活跃（最新）的审批块 ID。
+    // 多个审批块同时存在时，全局键盘监听仅作用于当前活跃的那一个，避免 Y/N 误触其他块。
+    let activeApprovalId = null;
+
     function renderApproval(id, name, args) {
+      // 每次新审批到来时，将其设为当前活跃块。
+      activeApprovalId = id;
+
       const box = document.createElement('div');
       box.className = 'approval';
-      box.innerHTML = `
-        <div class="head">⚠️ 需要审批：工具 ${escapeHtml(name)} 请求执行</div>
-        <div class="label">参数：</div>
-        <pre>${escapeHtml(pretty(args))}</pre>
-        <div class="btns">
-          <button class="btn-success">✓ 批准 (Y)</button>
-          <button class="btn-danger">✗ 拒绝 (N)</button>
-        </div>`;
+      box.innerHTML =
+        '<div class="head"><span>⚠️</span><span>需要审批：工具 ' + escapeHtml(name) + ' 请求执行</span></div>' +
+        '<div class="section-label">参数</div>' +
+        '<pre>' + escapeHtml(pretty(args)) + '</pre>' +
+        '<div class="btns">' +
+          '<button class="btn-success">✓ 批准 (Y)</button>' +
+          '<button class="btn-danger">✗ 拒绝 (N)</button>' +
+        '</div>';
       appendBlock(box);
 
       const respond = (approved) => {
@@ -628,10 +696,14 @@
         box.querySelector('.btns').innerHTML =
           `<span style="color:var(--text-dim)">${approved ? '✓ 已批准' : '✗ 已拒绝'} · ${formatTime()}</span>`;
         document.removeEventListener('keydown', keyHandler);
+        // 若响应的是当前活跃块，则清空活跃标记。
+        if (activeApprovalId === id) activeApprovalId = null;
       };
       box.querySelector('.btn-success').onclick = () => respond(true);
       box.querySelector('.btn-danger').onclick = () => respond(false);
       const keyHandler = (e) => {
+        // 仅当前活跃审批块响应键盘事件。
+        if (activeApprovalId !== id) return;
         if (e.key.toLowerCase() === 'y') respond(true);
         else if (e.key.toLowerCase() === 'n') respond(false);
       };
@@ -765,7 +837,7 @@
       el.querySelectorAll('pre code:not([data-hl])').forEach((b) => { hljs.highlightElement(b); b.dataset.hl = '1'; });
     }
 
-    function pretty(v) { if (v == null) return ''; try { return JSON.stringify(v, null, 2); } catch { return String(v); } }
+    function pretty(v) { if (v == null) return ''; try { return typeof v === 'string' ? v : JSON.stringify(v, null, 2); } catch { return String(v); } }
     function escapeHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
     function escapeAttr(s) { return String(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
     function cssEscape(s) { return String(s).replace(/["\\]/g, '\\$&'); }

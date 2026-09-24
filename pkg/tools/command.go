@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shenghuofei/chat-runtime/pkg/provider"
@@ -30,6 +31,9 @@ type CommandToolConfig struct {
 	Timeout time.Duration
 	// WorkDir 命令执行的工作目录（为空则继承当前进程工作目录）。
 	WorkDir string
+	// AutoApprove 为 true 时所有命令自动批准（跳过审批），无论是否命中危险模式。
+	// 默认 false，即危险命令需人工审批。
+	AutoApprove bool
 }
 
 // defaultCommandTimeout 默认命令执行超时。
@@ -131,6 +135,8 @@ type CommandTool struct {
 	dangerousPatterns []*regexp.Regexp
 	// combinedPattern 将所有危险模式合并为单个正则，匹配时只需一次调用。
 	combinedPattern *regexp.Regexp
+	// allowedSet 是 AllowedCommands 的 O(1) 查找索引（key 为命令名或完整路径）。
+	allowedSet map[string]struct{}
 }
 
 // NewCommandTool 创建一个命令执行工具。
@@ -152,10 +158,16 @@ func NewCommandTool(cfg CommandToolConfig) *CommandTool {
 	}
 	combined := regexp.MustCompile(strings.Join(parts, "|"))
 
+	allowedSet := make(map[string]struct{}, len(cfg.AllowedCommands))
+	for _, cmd := range cfg.AllowedCommands {
+		allowedSet[cmd] = struct{}{}
+	}
+
 	return &CommandTool{
 		config:            cfg,
 		dangerousPatterns: patterns,
 		combinedPattern:   combined,
+		allowedSet:        allowedSet,
 	}
 }
 
@@ -164,7 +176,7 @@ func (t *CommandTool) Name() string { return "command" }
 
 // Description 返回工具描述。
 func (t *CommandTool) Description() string {
-	return "在受控环境中执行 shell 命令。参数以 command（可执行文件名）与 args（参数数组）给出，" +
+	return "在受控环境中执行系统命令。参数以 command（可执行文件名）与 args（参数数组）给出，" +
 		"不支持管道、重定向等 shell 语法。危险命令将触发人工审批。"
 }
 
@@ -196,7 +208,7 @@ func (t *CommandTool) Schema() provider.ToolDef {
 // CommandTool 标记为”可能需要审批”（true），使其进入 approvalTool 装饰流程。
 // 实际上只有危险命令才会触发审批弹窗——approvalTool 会调用 NeedApprovalFor
 // 按参数动态判断，安全命令（ls、pwd 等）不会打扰用户。
-func (t *CommandTool) NeedApproval() bool { return true }
+func (t *CommandTool) NeedApproval() bool { return !t.config.AutoApprove }
 
 // NeedApprovalFor 根据实际调用参数判断是否需要审批。
 //
@@ -242,17 +254,16 @@ func baseName(command string) string {
 }
 
 // IsAllowed 判断命令是否在白名单内。白名单为空时视为放行。
+//
+// 使用预建的 allowedSet map 做 O(1) 查找，避免每次执行命令时的 O(N) 线性遍历。
 func (t *CommandTool) IsAllowed(command string) bool {
-	if len(t.config.AllowedCommands) == 0 {
+	if len(t.allowedSet) == 0 {
 		return true
 	}
 	name := baseName(command)
-	for _, allowed := range t.config.AllowedCommands {
-		if name == allowed || command == allowed {
-			return true
-		}
-	}
-	return false
+	_, byName := t.allowedSet[name]
+	_, byFull := t.allowedSet[command]
+	return byName || byFull
 }
 
 // IsDangerous 判断完整命令行是否命中任一危险模式。
@@ -323,13 +334,19 @@ func (t *CommandTool) Execute(ctx context.Context, arguments string) (string, er
 
 // limitedWriter 是一个包装 bytes.Buffer 的写入器，超过 limit 字节后停止写入
 // 并标记 truncated，防止命令产生海量输出耗尽内存。
+//
+// exec.Command 会将 Stdout 与 Stderr 指向同一个 limitedWriter，
+// 且由两个独立的 goroutine 并发写入，因此需要 mutex 保护内部状态。
 type limitedWriter struct {
+	mu        sync.Mutex
 	buf       bytes.Buffer
 	limit     int
 	truncated bool
 }
 
 func (lw *limitedWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
 	if lw.truncated {
 		return len(p), nil // 已截断，丢弃后续数据
 	}

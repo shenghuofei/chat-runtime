@@ -3,7 +3,7 @@
 
 # ---- 变量 ----
 BINARY      := chat-runtime
-MODULE      := github.com/chat-runtime/chat-runtime
+MODULE      := github.com/shenghuofei/chat-runtime
 DIST        := dist
 
 # 版本信息：优先取 git tag，其次取短 commit；构建时间为 UTC。

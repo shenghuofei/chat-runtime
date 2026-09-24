@@ -8,16 +8,16 @@
 //     content_block_stop / message_delta / message_stop 事件类型
 //   - 必须显式传 max_tokens（无默认值）
 //
+// 本适配器通过嵌入 baseProvider 复用 HTTP 请求与重试逻辑。
+//
 // 参考文档: https://docs.anthropic.com/en/api/messages
 package provider
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -31,13 +31,9 @@ const (
 )
 
 // claudeProvider 实现 Anthropic Messages API 的 Provider。
+// 嵌入 baseProvider 复用 HTTP 与重试逻辑。
 type claudeProvider struct {
-	name         string
-	model        string
-	baseURL      string
-	apiKey       string
-	extraHeaders map[string]string
-	httpClient   *http.Client
+	baseProvider
 }
 
 // NewClaudeProvider 创建 Claude 专用 Provider。
@@ -51,20 +47,15 @@ func NewClaudeProvider(cfg ProviderConfig) (Provider, error) {
 		model = defaultClaudeModel
 	}
 	return &claudeProvider{
-		name:         "claude",
-		model:        model,
-		baseURL:      baseURL,
-		apiKey:       cfg.APIKey,
-		extraHeaders: cfg.ExtraHeaders,
-		httpClient:   newHTTPClient(),
+		baseProvider: baseProvider{
+			name:         "claude",
+			model:        model,
+			baseURL:      baseURL,
+			apiKey:       cfg.APIKey,
+			extraHeaders: cfg.ExtraHeaders,
+			httpClient:   newHTTPClient(),
+		},
 	}, nil
-}
-
-func (p *claudeProvider) Name() string { return p.name }
-
-func (p *claudeProvider) Close() error {
-	p.httpClient.CloseIdleConnections()
-	return nil
 }
 
 // ---- Anthropic 请求/响应结构体 ----
@@ -171,8 +162,11 @@ func (p *claudeProvider) Chat(ctx context.Context, messages []Message, tools []T
 		return nil, fmt.Errorf("claude: 序列化请求体失败: %w", err)
 	}
 
-	// 发送请求（带重试）
-	resp, err := p.doWithRetry(ctx, payload)
+	// 使用 baseProvider.doWithRetry，Anthropic 鉴权通过 headerAnthropicKey
+	url := p.baseURL + "/v1/messages"
+	resp, err := p.doWithRetry(ctx, url, payload, headerAnthropicKey, func(req *http.Request) {
+		req.Header.Set("anthropic-version", claudeAPIVersion)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -185,19 +179,19 @@ func (p *claudeProvider) Chat(ctx context.Context, messages []Message, tools []T
 // splitSystemPrompt 将 system 消息从消息列表中分离出来
 // Anthropic 要求 system prompt 作为请求体顶层字段
 func (p *claudeProvider) splitSystemPrompt(messages []Message) (string, []Message) {
-	var system string
+	var sb strings.Builder
 	var rest []Message
 	for _, m := range messages {
 		if m.Role == RoleSystem {
-			if system != "" {
-				system += "\n\n"
+			if sb.Len() > 0 {
+				sb.WriteString("\n\n")
 			}
-			system += m.Content
+			sb.WriteString(m.Content)
 		} else {
 			rest = append(rest, m)
 		}
 	}
-	return system, rest
+	return sb.String(), rest
 }
 
 // convertMessages 将统一消息格式转换为 Anthropic 格式
@@ -236,14 +230,25 @@ func (p *claudeProvider) convertMessages(messages []Message) []claudeMessage {
 			}
 
 		case RoleTool:
-			// Anthropic 工具结果是 user 角色消息中的 tool_result content block
+			// Anthropic 要求同一轮的所有 tool_result 必须合并在同一个 user 消息中。
+			// 若上一条已是包含 tool_result 的 user 消息，则追加到其中；否则新建。
+			toolBlock := claudeContentBlock{
+				Type:      "tool_result",
+				ToolUseID: m.ToolCallID,
+				Content:   m.Content,
+			}
+			if n := len(result); n > 0 {
+				if last := result[n-1]; last.Role == "user" {
+					if blocks, ok := last.Content.([]claudeContentBlock); ok &&
+						len(blocks) > 0 && blocks[0].Type == "tool_result" {
+						result[n-1].Content = append(blocks, toolBlock)
+						continue
+					}
+				}
+			}
 			result = append(result, claudeMessage{
-				Role: "user",
-				Content: []claudeContentBlock{{
-					Type:      "tool_result",
-					ToolUseID: m.ToolCallID,
-					Content:   m.Content,
-				}},
+				Role:    "user",
+				Content: []claudeContentBlock{toolBlock},
 			})
 		}
 	}
@@ -265,58 +270,6 @@ func (p *claudeProvider) convertTools(tools []ToolDef) []claudeTool {
 		})
 	}
 	return result
-}
-
-// doWithRetry 带重试的 HTTP 请求
-func (p *claudeProvider) doWithRetry(ctx context.Context, payload []byte) (*http.Response, error) {
-	url := p.baseURL + "/v1/messages"
-
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			if !retrySleep(ctx, attempt) {
-				return nil, ctx.Err()
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-		if err != nil {
-			return nil, fmt.Errorf("claude: 构造请求失败: %w", err)
-		}
-		// Anthropic 鉴权：x-api-key 头
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("x-api-key", p.apiKey)
-		req.Header.Set("anthropic-version", claudeAPIVersion)
-		for k, v := range p.extraHeaders {
-			req.Header.Set(k, v)
-		}
-
-		resp, err := p.httpClient.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			lastErr = fmt.Errorf("claude: 请求发送失败: %w", err)
-			continue
-		}
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return resp, nil
-		}
-
-		body := readErrorBody(resp)
-		_ = resp.Body.Close()
-
-		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
-			lastErr = fmt.Errorf("claude: 服务端错误 (状态码 %d): %s", resp.StatusCode, truncateBody(body))
-			continue
-		}
-
-		return nil, fmt.Errorf("claude: 请求被拒绝 (状态码 %d): %s", resp.StatusCode, truncateBody(body))
-	}
-
-	return nil, fmt.Errorf("claude: 重试 %d 次后仍失败: %w", maxRetries, lastErr)
 }
 
 // streamResponse 解析 Anthropic SSE 流
@@ -343,45 +296,18 @@ func (p *claudeProvider) streamResponse(ctx context.Context, resp *http.Response
 	// 跟踪 token 用量
 	var inputTokens, outputTokens int
 
-	for {
-		if ctx.Err() != nil {
-			sendResponse(ctx, out, StreamResponse{Err: ctx.Err()})
-			return
-		}
+	// onEvent 更新当前事件类型（event: 前缀行）。
+	onEvent := func(eventType string) {
+		currentEventType = eventType
+	}
 
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			sendResponse(ctx, out, StreamResponse{Err: fmt.Errorf("claude: 读取流失败: %w", err)})
-			return
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		// 解析 event: 前缀
-		if strings.HasPrefix(line, "event:") {
-			currentEventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-
-		// 解析 data: 前缀
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" {
-			continue
-		}
-
+	// handler 处理每条 data: 行，按 currentEventType 分发。
+	// 返回 true 表示流应终止（message_stop）。
+	handler := func(data string) (done bool) {
 		var event claudeStreamEvent
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			sendResponse(ctx, out, StreamResponse{Err: fmt.Errorf("claude: 解析事件失败: %w", err)})
-			continue
+			return false
 		}
 
 		switch currentEventType {
@@ -404,7 +330,7 @@ func (p *claudeProvider) streamResponse(ctx context.Context, resp *http.Response
 
 		case "content_block_delta":
 			if event.Delta == nil {
-				continue
+				return false
 			}
 			switch event.Delta.Type {
 			case "text_delta":
@@ -471,7 +397,14 @@ func (p *claudeProvider) streamResponse(ctx context.Context, resp *http.Response
 					TotalTokens:      inputTokens + outputTokens,
 				},
 			})
-			return
+			return true
 		}
+		return false
 	}
+
+	onError := func(err error) {
+		sendResponse(ctx, out, StreamResponse{Err: fmt.Errorf("claude: 读取流失败: %w", err)})
+	}
+
+	readSSELinesWithEvent(ctx, reader, onEvent, handler, onError)
 }

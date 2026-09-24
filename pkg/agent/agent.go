@@ -15,9 +15,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/shenghuofei/chat-runtime/pkg/manager"
 	"github.com/shenghuofei/chat-runtime/pkg/provider"
@@ -66,6 +68,9 @@ type Event struct {
 	ToolResult string `json:"result,omitempty"`
 	// ApprovalID 审批请求的唯一标识（EventApproval 使用），用于匹配审批回复。
 	ApprovalID string `json:"approval_id,omitempty"`
+	// ToolCallID 工具调用的唯一标识（EventToolCall / EventToolResult 使用），
+	// 用于前端将结果精确回填到对应的调用块，避免同名工具并发时错位。
+	ToolCallID string `json:"call_id,omitempty"`
 	// Usage token 用量（EventDone 使用）。
 	Usage *Usage `json:"usage,omitempty"`
 }
@@ -96,12 +101,21 @@ type Tool interface {
 type AgentConfig struct {
 	// MaxIterations Tool Calling 循环的最大迭代次数，防止无限循环。<=0 时使用默认值。
 	MaxIterations int
+	// ToolTimeout 单个工具调用的超时时间。<=0 时使用默认值（60s）。
+	// 避免某个 MCP 工具的远端服务 hang 住时阻塞整轮所有工具结果的回填。
+	ToolTimeout time.Duration
 	// OnMessageAdded 每条消息写入 manager 后触发，用于增量持久化。可为 nil。
 	OnMessageAdded func(msg provider.Message)
+	// ProviderOptions 传递给 provider.Chat 的生成参数选项（如温度、MaxTokens、TopP）。
+	// 由上层根据 ModelConfig 构造，使采样参数配置真正生效。
+	ProviderOptions []provider.Option
 }
 
 // defaultMaxIterations 是 Tool Calling 循环的默认上限。
 const defaultMaxIterations = 25
+
+// defaultToolTimeout 是单个工具调用的默认超时。
+const defaultToolTimeout = 60 * time.Second
 
 // Agent 编排一次会话的 LLM 调用与工具执行循环。
 //
@@ -129,12 +143,20 @@ type Agent struct {
 	toolDefsCache []provider.ToolDef
 	// toolDefsDirty 标记缓存是否需要重建。
 	toolDefsDirty bool
+
+	// emitMu 保护 emit 回调的并发调用。
+	// Run 中同一轮的多个 tool_calls 在各自 goroutine 内并发触发 emit，
+	// 而 emit（Transport 层）通常不是线程安全的，因此需串行化。
+	emitMu sync.Mutex
 }
 
 // New 创建一个 Agent。
 func New(p provider.Provider, mgr *manager.Manager, cfg AgentConfig) *Agent {
 	if cfg.MaxIterations <= 0 {
 		cfg.MaxIterations = defaultMaxIterations
+	}
+	if cfg.ToolTimeout <= 0 {
+		cfg.ToolTimeout = defaultToolTimeout
 	}
 	return &Agent{
 		provider:      p,
@@ -148,6 +170,14 @@ func New(p provider.Provider, mgr *manager.Manager, cfg AgentConfig) *Agent {
 // SetApprovalHandler 设置审批处理器。设置后，需要审批的工具会在执行前被装饰。
 func (a *Agent) SetApprovalHandler(h ApprovalHandler) {
 	a.approval = h
+}
+
+// SetProviderOptions 设置传递给 provider.Chat 的生成参数选项（温度 / MaxTokens / TopP 等）。
+//
+// 由上层（如 main.buildAgent）根据 ModelConfig 构造后注入，使采样参数配置真正生效。
+// 应在 Run 之前调用（会话初始化阶段），运行期不建议修改。
+func (a *Agent) SetProviderOptions(opts ...provider.Option) {
+	a.config.ProviderOptions = opts
 }
 
 // RegisterTool 注册一个工具。若同名工具已存在则覆盖。
@@ -255,6 +285,14 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 		emit = func(Event) {}
 	}
 
+	// safeEmit 用 mutex 包裹 emit，保证并发工具执行时的事件推送是线程安全的。
+	// 后续所有事件推送（含传给 execToolCall 的回调）都应使用 safeEmit。
+	safeEmit := func(ev Event) {
+		a.emitMu.Lock()
+		defer a.emitMu.Unlock()
+		emit(ev)
+	}
+
 	// 追加用户输入。
 	a.manager.AddUserMessage(provider.Message{Content: input})
 	if a.config.OnMessageAdded != nil {
@@ -269,10 +307,14 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 			return err
 		}
 
+		// compress 模式：在锁外执行按需摘要压缩（Summarizer 可能是耗时网络 IO），
+		// 避免在 manager 写锁期间做网络请求阻塞其他并发操作。
+		a.manager.CompressIfNeeded()
+
 		messages := a.manager.GetMessages()
-		stream, err := a.provider.Chat(ctx, messages, a.toolDefs())
+		stream, err := a.provider.Chat(ctx, messages, a.toolDefs(), a.config.ProviderOptions...)
 		if err != nil {
-			emit(Event{Type: EventError, Content: err.Error()})
+			safeEmit(Event{Type: EventError, Content: err.Error()})
 			return err
 		}
 
@@ -280,6 +322,12 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 		var contentBuf strings.Builder
 		var toolCalls []provider.ToolCall
 		var streamErr error
+		// 流式响应中可能多次收到 usage：
+		// - OpenAI 兼容类：通常仅末尾一次（增量语义）
+		// - Gemini：每个 chunk 都可能带（累计语义）
+		// 为兼容两种语义，采用"取最后一次"而非累加。
+		// 对 OpenAI 兼容类（仅末尾一次）不影响；对 Gemini（多次累计值）取最后一次即为正确累计。
+		var lastUsage *provider.TokenUsage
 		for chunk := range stream {
 			if chunk.Err != nil {
 				streamErr = chunk.Err
@@ -289,23 +337,32 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 			}
 			if chunk.Delta.Content != "" {
 				contentBuf.WriteString(chunk.Delta.Content)
-				emit(Event{Type: EventToken, Content: chunk.Delta.Content})
+				safeEmit(Event{Type: EventToken, Content: chunk.Delta.Content})
 			}
 			if len(chunk.Delta.ToolCalls) > 0 {
 				toolCalls = append(toolCalls, chunk.Delta.ToolCalls...)
 			}
 			if chunk.Usage != nil {
-				total.PromptTokens += chunk.Usage.PromptTokens
-				total.CompletionTokens += chunk.Usage.CompletionTokens
-				total.TotalTokens += chunk.Usage.TotalTokens
-				a.manager.ReportUsage(*chunk.Usage)
+				lastUsage = chunk.Usage
 			}
 		}
 		if streamErr != nil {
-			emit(Event{Type: EventError, Content: streamErr.Error()})
+			safeEmit(Event{Type: EventError, Content: streamErr.Error()})
 			return streamErr
 		}
+		// 流结束后统一结算本轮 usage：total 跨多轮循环累加，每轮只加一次 lastUsage。
+		if lastUsage != nil {
+			total.PromptTokens += lastUsage.PromptTokens
+			total.CompletionTokens += lastUsage.CompletionTokens
+			total.TotalTokens += lastUsage.TotalTokens
+			a.manager.ReportUsage(*lastUsage)
+		}
 		content := contentBuf.String()
+
+		// 按 ToolCall.ID 去重：防止某些 Provider 在流中既发增量分片又发最终完整列表
+		// 时产生重复条目。当前各 Provider 实现遵守"每 chunk 不重复"的契约，
+		// 此去重为防御性保护。
+		toolCalls = deduplicateToolCalls(toolCalls)
 
 		// 记录本轮 assistant 消息（可能携带 tool_calls）。
 		assistantMsg := provider.Message{
@@ -320,7 +377,7 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 
 		// 无工具调用：本轮结束。
 		if len(toolCalls) == 0 {
-			emit(Event{Type: EventDone, Usage: &total})
+			safeEmit(Event{Type: EventDone, Usage: &total})
 			return nil
 		}
 
@@ -334,17 +391,14 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 		results := make([]toolResult, len(toolCalls))
 		var wg sync.WaitGroup
 		for i, tc := range toolCalls {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
 			wg.Add(1)
 			go func(idx int, call provider.ToolCall) {
 				defer wg.Done()
 				// 捕获任何 panic，避免单个工具的崩溃导致 wg.Wait 永久阻塞。
 				defer func() {
 					if r := recover(); r != nil {
-						errMsg := fmt.Sprintf("工具 %q 执行时发生 panic: %v", call.Name, r)
-						emit(Event{Type: EventError, Content: errMsg})
+						errMsg := fmt.Sprintf("工具 %q 执行时发生 panic: %v\n%s", call.Name, r, debug.Stack())
+						safeEmit(Event{Type: EventError, Content: errMsg})
 						results[idx] = toolResult{
 							callID: call.ID,
 							name:   call.Name,
@@ -352,11 +406,21 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 						}
 					}
 				}()
-				res := a.execToolCall(ctx, call, emit)
+				// 为每个工具调用施加独立超时，避免单个工具 hang 住阻塞整轮。
+				toolCtx, toolCancel := context.WithTimeout(ctx, a.config.ToolTimeout)
+				defer toolCancel()
+				res := a.execToolCall(toolCtx, call, safeEmit)
 				results[idx] = toolResult{callID: call.ID, name: call.Name, result: res}
 			}(i, tc)
 		}
+		// 无论 ctx 是否已取消，都必须 Wait 已启动的 goroutine，避免泄漏。
+		// 已启动的 goroutine 通过 toolCtx 感知取消并尽快返回。
 		wg.Wait()
+
+		// 取消检查移到 wg.Wait 之后：若已取消则不回填结果直接返回。
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		// 按原始顺序回填结果（保持 Prompt Cache 稳定性）。
 		for _, tr := range results {
@@ -375,7 +439,7 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 
 	// 达到最大迭代次数仍未终止。
 	err := fmt.Errorf("已达到最大工具调用迭代次数 (%d)", a.config.MaxIterations)
-	emit(Event{Type: EventError, Content: err.Error()})
+	safeEmit(Event{Type: EventError, Content: err.Error()})
 	return err
 }
 
@@ -383,12 +447,12 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) error {
 func (a *Agent) execToolCall(ctx context.Context, tc provider.ToolCall, emit func(Event)) string {
 	// 解析参数用于事件展示（失败不阻断执行）。
 	args := parseArgs(tc.Arguments)
-	emit(Event{Type: EventToolCall, ToolName: tc.Name, ToolArgs: args})
+	emit(Event{Type: EventToolCall, ToolName: tc.Name, ToolArgs: args, ToolCallID: tc.ID})
 
 	tool, ok := a.resolveTool(tc.Name)
 	if !ok {
 		result := fmt.Sprintf("未找到工具 %q。", tc.Name)
-		emit(Event{Type: EventToolResult, ToolName: tc.Name, ToolResult: result})
+		emit(Event{Type: EventToolResult, ToolName: tc.Name, ToolResult: result, ToolCallID: tc.ID})
 		return result
 	}
 
@@ -396,7 +460,7 @@ func (a *Agent) execToolCall(ctx context.Context, tc provider.ToolCall, emit fun
 	if err != nil {
 		result = fmt.Sprintf("工具执行失败：%v", err)
 	}
-	emit(Event{Type: EventToolResult, ToolName: tc.Name, ToolResult: result})
+	emit(Event{Type: EventToolResult, ToolName: tc.Name, ToolResult: result, ToolCallID: tc.ID})
 	return result
 }
 
@@ -410,4 +474,24 @@ func parseArgs(arguments string) map[string]any {
 		return map[string]any{"_raw": arguments}
 	}
 	return m
+}
+
+// deduplicateToolCalls 按 ToolCall.ID 去重，保留首次出现的条目。
+// 对无 ID 的工具调用（如 Gemini 自生成 ID 始终唯一）不影响。
+func deduplicateToolCalls(calls []provider.ToolCall) []provider.ToolCall {
+	if len(calls) <= 1 {
+		return calls
+	}
+	seen := make(map[string]bool, len(calls))
+	out := make([]provider.ToolCall, 0, len(calls))
+	for _, tc := range calls {
+		if tc.ID != "" && seen[tc.ID] {
+			continue
+		}
+		if tc.ID != "" {
+			seen[tc.ID] = true
+		}
+		out = append(out, tc)
+	}
+	return out
 }

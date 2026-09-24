@@ -48,6 +48,16 @@ jobs:
       - name: Test
         run: go test ./... -v -race -coverprofile=coverage.out
 
+      # 覆盖率门禁：总覆盖率低于阈值（25%）则失败
+      - name: Check coverage
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < 25" | bc -l) )); then
+            echo "::error::Coverage ${COVERAGE}% is below threshold 25%"
+            exit 1
+          fi
+
       # 构建二进制，确保可编译
       - name: Build
         run: go build -v ./...

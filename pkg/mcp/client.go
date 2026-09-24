@@ -39,6 +39,9 @@ type MCPClient struct {
 	config config.MCPServerConfig
 	// raw 底层 mcp-go 客户端。
 	raw *mcpclient.Client
+	// rawMu 保护 raw 字段的并发读写：reconnect 会替换 raw（写），
+	// 而 callTool / DiscoverTools / Close 会读取 raw，需用读写锁避免数据竞争。
+	rawMu sync.RWMutex
 
 	// serverMu Server 级串行锁：no_concurrent=true 时，所有工具调用共用它。
 	serverMu sync.Mutex
@@ -148,7 +151,10 @@ func mapToEnvSlice(env map[string]string) []string {
 //
 // ctx 用于控制请求超时与取消。
 func (c *MCPClient) DiscoverTools(ctx context.Context) ([]agent.Tool, error) {
-	res, err := c.raw.ListTools(ctx, mcp.ListToolsRequest{})
+	c.rawMu.RLock()
+	raw := c.raw
+	c.rawMu.RUnlock()
+	res, err := raw.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("发现 MCP 工具失败：%w", err)
 	}
@@ -225,13 +231,21 @@ func (c *MCPClient) callTool(ctx context.Context, rawName string, arguments stri
 	req.Params.Name = rawName
 	req.Params.Arguments = argMap
 
-	res, err := c.raw.CallTool(ctx, req)
+	c.rawMu.RLock()
+	raw := c.raw
+	c.rawMu.RUnlock()
+	res, err := raw.CallTool(ctx, req)
 	if err != nil {
 		// 工具调用失败时尝试重连一次（对 stdio 子进程崩溃场景尤为有效）。
-		if rerr := c.reconnect(ctx); rerr != nil {
+		// 传入当时读取的 raw，若已被其他 goroutine 重连替换则 reconnect 直接返回。
+		if rerr := c.reconnect(ctx, raw); rerr != nil {
 			return "", fmt.Errorf("调用 MCP 工具 %q 失败且重连失败：%w；重连错误：%w", rawName, err, rerr)
 		}
-		res, err = c.raw.CallTool(ctx, req)
+		// reconnect 已替换 c.raw（或已被其他 goroutine 替换），重新读取最新的客户端。
+		c.rawMu.RLock()
+		raw = c.raw
+		c.rawMu.RUnlock()
+		res, err = raw.CallTool(ctx, req)
 		if err != nil {
 			return "", fmt.Errorf("MCP 工具 %q 重连后调用仍失败：%w", rawName, err)
 		}
@@ -245,11 +259,22 @@ func (c *MCPClient) callTool(ctx context.Context, rawName string, arguments stri
 }
 
 // reconnect 关闭当前连接并重新建立（含 Start + Initialize），加锁防止并发重连。
-func (c *MCPClient) reconnect(ctx context.Context) error {
+// failedRaw 为调用方发现失败时持有的 raw 指针：若当前 c.raw 已不是它，
+// 说明已有其他 goroutine 完成重连，本次直接返回避免重复重连。
+func (c *MCPClient) reconnect(ctx context.Context, failedRaw *mcpclient.Client) error {
 	c.reconnectMu.Lock()
 	defer c.reconnectMu.Unlock()
 
-	_ = c.raw.Close()
+	c.rawMu.RLock()
+	oldRaw := c.raw
+	c.rawMu.RUnlock()
+	// 幂等检查：若 c.raw 已被其他 goroutine 替换，则本次无需重连。
+	if oldRaw != failedRaw {
+		return nil
+	}
+	if oldRaw != nil {
+		_ = oldRaw.Close()
+	}
 
 	raw, err := newRawClient(c.config)
 	if err != nil {
@@ -270,7 +295,9 @@ func (c *MCPClient) reconnect(ctx context.Context) error {
 		return fmt.Errorf("重新初始化 MCP 会话失败：%w", err)
 	}
 
+	c.rawMu.Lock()
 	c.raw = raw
+	c.rawMu.Unlock()
 	return nil
 }
 
@@ -290,10 +317,13 @@ func extractText(res *mcp.CallToolResult) string {
 
 // Close 关闭底层客户端连接（对 stdio 会终止子进程）。
 func (c *MCPClient) Close() error {
-	if c.raw == nil {
+	c.rawMu.RLock()
+	raw := c.raw
+	c.rawMu.RUnlock()
+	if raw == nil {
 		return nil
 	}
-	return c.raw.Close()
+	return raw.Close()
 }
 
 // contains 判断字符串是否在切片中。

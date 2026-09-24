@@ -1,12 +1,10 @@
 package agent
 
 import (
-	"container/list"
 	"context"
 	"fmt"
-	"os"
+	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/shenghuofei/chat-runtime/pkg/config"
@@ -15,12 +13,11 @@ import (
 	"github.com/shenghuofei/chat-runtime/pkg/store"
 )
 
-// ProviderFactory 根据对话配置创建（或复用）一个 Provider 实例。
+// ProviderFactory 创建（或复用）一个 Provider 实例。
 //
-// 由上层注入，屏蔽“ChatConfig → Model → Provider”的解析细节，
-// 使 Session 不直接依赖具体 Provider 的构造过程。
-type ProviderFactory func(chatConfig config.ChatConfig) (provider.Provider, error)
-
+// 由上层注入，屏蔽具体 Provider 的构造过程，
+// 使 Session 不直接依赖配置解析逻辑。
+type ProviderFactory func() (provider.Provider, error)
 // Session 表示一次会话，聚合了 Agent、上下文管理器、持久化 Store 与元信息。
 type Session struct {
 	// ID 会话唯一标识。
@@ -60,7 +57,7 @@ func NewSession(
 	}
 
 	// 1. 创建 Provider。
-	p, err := providerFactory(chatConfig)
+	p, err := providerFactory()
 	if err != nil {
 		return nil, fmt.Errorf("创建 provider 失败：%w", err)
 	}
@@ -89,13 +86,21 @@ func NewSession(
 			if data.SystemPrompt != "" {
 				mgr.SetSystemPrompt(data.SystemPrompt)
 			}
+			if data.TokenUsage.TotalTokens > 0 {
+				// 仅设字段，不触发裁剪——上下文已是上次持久化时裁剪后的结果。
+				mgr.LoadUsage(data.TokenUsage)
+			}
 		}
 		if logMsgs, err := st.LoadLog(context.Background(), id); err == nil && len(logMsgs) > 0 {
+			// Save→truncate 两步非原子：崩溃时可能出现 checkpoint 已含某些消息、
+			// log 未被截断的窗口，导致 checkpoint 尾部与 log 头部重叠。
+			// 合并前先去重，避免恢复出重复消息。
+			logMsgs = deduplicateLog(msgs, logMsgs)
 			msgs = append(msgs, logMsgs...)
 		}
 		if len(msgs) > 0 {
 			if verr := manager.ValidateRound(msgs); verr != nil {
-				fmt.Fprintf(os.Stderr, "[警告] 会话 %q 历史消息不完整，已尽力恢复: %v\n", id, verr)
+				slog.Warn("会话历史消息不完整，已尽力恢复", "session", id, "error", verr)
 			}
 			mgr.Load(msgs)
 		}
@@ -105,7 +110,9 @@ func NewSession(
 	agCfg := AgentConfig{MaxIterations: chatConfig.MaxIterations}
 	if st != nil {
 		agCfg.OnMessageAdded = func(msg provider.Message) {
-			_ = st.AppendMessage(context.Background(), id, msg)
+			if err := st.AppendMessage(context.Background(), id, msg); err != nil {
+				slog.Warn("增量持久化失败", "session", id, "role", msg.Role, "error", err)
+			}
 		}
 	}
 	ag := New(p, mgr, agCfg)
@@ -123,6 +130,61 @@ func NewSession(
 	}, nil
 }
 
+// deduplicateLog 去除增量日志中与 checkpoint 尾部重叠的前缀。
+//
+// 背景：Store.Save 采用「先 rename 提交快照、再 truncate 日志」两步，二者非原子。
+// 若在两步之间进程崩溃，恢复时会得到「已包含尾部消息的 checkpoint」+「尚未截断、
+// 头部与 checkpoint 尾部重叠的 log」，直接 append 会产生重复消息。
+//
+// 策略：从最大可能重叠长度开始递减，寻找 checkpoint 尾部与 log 头部完全相等的
+// 前缀，命中则跳过 log 中重叠的部分，仅返回其后的新增消息。
+func deduplicateLog(checkpoint, log []provider.Message) []provider.Message {
+	if len(checkpoint) == 0 || len(log) == 0 {
+		return log
+	}
+	// 崩溃恢复场景下重叠通常极少（1~2 条），从小到大扫描比从大到小更早命中，
+	// 避免从最大可能值开始逐步缩小造成的 O(N²) 最坏情况。
+	for overlap := 1; overlap <= min(len(checkpoint), len(log)); overlap++ {
+		if messagesEqual(checkpoint[len(checkpoint)-overlap:], log[:overlap]) {
+			return log[overlap:]
+		}
+	}
+	return log
+}
+
+// messagesEqual 比较两个消息切片是否逐条相等（基于角色、内容、ToolCallID、
+// 工具名与工具调用列表）。用于 deduplicateLog 判定前缀重叠。
+func messagesEqual(a, b []provider.Message) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !messageEqual(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// messageEqual 比较单条消息是否相等。
+func messageEqual(x, y provider.Message) bool {
+	if x.Role != y.Role || x.Content != y.Content ||
+		x.ToolCallID != y.ToolCallID || x.Name != y.Name {
+		return false
+	}
+	if len(x.ToolCalls) != len(y.ToolCalls) {
+		return false
+	}
+	for i := range x.ToolCalls {
+		if x.ToolCalls[i].ID != y.ToolCalls[i].ID ||
+			x.ToolCalls[i].Name != y.ToolCalls[i].Name ||
+			x.ToolCalls[i].Arguments != y.ToolCalls[i].Arguments {
+			return false
+		}
+	}
+	return true
+}
+
 // Touch 更新最近活跃时间。
 func (s *Session) Touch() {
 	s.LastActiveAt = time.Now()
@@ -134,154 +196,22 @@ func (s *Session) Persist() error {
 		return nil
 	}
 	data := store.SessionData{
-		Messages: s.manager.Raw(),
-		Metadata: map[string]any{"chat": s.ChatName},
+		Messages:     s.manager.Raw(),
+		SystemPrompt: s.manager.SystemPrompt(),
+		TokenUsage:   s.manager.LastUsage(),
+		Metadata:     map[string]any{"chat": s.ChatName},
 	}
 	return s.Store.Save(context.Background(), s.ID, data)
 }
 
-// Close 释放会话资源：持久化历史并关闭 Provider 连接。
+// Close 释放会话资源：仅持久化会话历史，不关闭 Provider 连接。
+//
+// 注意：provider 来自全局缓存（main() 中的 globalProviderCache），多个会话共享
+// 同一个 Provider 实例以复用 HTTP 连接池。若在此关闭，会导致其他仍在使用该
+// Provider 的会话连接被意外关闭。因此 Provider 的生命周期由 main() 统一管理
+// （进程退出时统一 Close），此处不再调用 s.provider.Close()。
 func (s *Session) Close() error {
-	var firstErr error
-	if err := s.Persist(); err != nil {
-		firstErr = err
-	}
-	if s.provider != nil {
-		if err := s.provider.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-// SessionManagerConfig 是 SessionManager 的配置。
-type SessionManagerConfig struct {
-	// MaxSessions 最大并发会话数（<=0 表示不限制）。超出时按 LRU 淘汰最久未活跃的会话。
-	MaxSessions int
-	// ProviderFactory 创建 Provider 的工厂。
-	ProviderFactory ProviderFactory
-	// Store 会话持久化后端（可为 nil，表示不持久化）。
-	Store store.Store
-	// ChatConfigs 对话配置表，key 为对话名，用于 GetOrCreate 时解析会话配置。
-	ChatConfigs map[string]config.ChatConfig
-}
-
-// SessionManager 管理多个会话，支持 LRU 淘汰空闲会话。
-//
-// 内部使用一个双向链表维护 LRU 顺序：表头为最近活跃，表尾为最久未活跃。
-type SessionManager struct {
-	mu sync.Mutex
-	// sessions id -> *list.Element（其 Value 为 *Session）。
-	sessions map[string]*list.Element
-	// lru 双向链表，Front 最近活跃，Back 最久未活跃。
-	lru *list.List
-	// config 配置。
-	config SessionManagerConfig
-}
-
-// NewSessionManager 创建一个 SessionManager。
-func NewSessionManager(config SessionManagerConfig) *SessionManager {
-	return &SessionManager{
-		sessions: make(map[string]*list.Element),
-		lru:      list.New(),
-		config:   config,
-	}
-}
-
-// GetOrCreate 获取已有会话；不存在则创建。
-//
-// 每次调用都会把该会话移动到 LRU 表头并刷新活跃时间。
-// 创建新会话后若超出 MaxSessions，则淘汰最久未活跃的会话。
-func (sm *SessionManager) GetOrCreate(id, chatName string) (*Session, error) {
-	sm.mu.Lock()
-
-	// 命中已有会话。
-	if elem, ok := sm.sessions[id]; ok {
-		sess := elem.Value.(*Session)
-		sess.Touch()
-		sm.lru.MoveToFront(elem)
-		sm.mu.Unlock()
-		return sess, nil
-	}
-
-	// 解析对话配置。
-	chatConfig, ok := sm.config.ChatConfigs[chatName]
-	if !ok {
-		sm.mu.Unlock()
-		return nil, fmt.Errorf("未找到名为 %q 的对话配置", chatName)
-	}
-
-	// 创建新会话。
-	sess, err := NewSession(id, chatName, chatConfig, sm.config.ProviderFactory, sm.config.Store)
-	if err != nil {
-		sm.mu.Unlock()
-		return nil, err
-	}
-
-	elem := sm.lru.PushFront(sess)
-	sm.sessions[id] = elem
-
-	// 超出上限则按 LRU 淘汰（收集待淘汰会话，锁外执行 Close）。
-	evicted := sm.evictIfNeededLocked()
-	sm.mu.Unlock()
-
-	// 在锁外执行可能较慢的 Close（持久化 + 网络关闭），避免阻塞其他请求。
-	for _, s := range evicted {
-		if err := s.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "[警告] 淘汰会话 %q 时出错: %v\n", s.ID, err)
-		}
-	}
-
-	return sess, nil
-}
-
-// Get 仅获取已有会话，不存在时返回 (nil, false)。
-func (sm *SessionManager) Get(id string) (*Session, bool) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	elem, ok := sm.sessions[id]
-	if !ok {
-		return nil, false
-	}
-	sess := elem.Value.(*Session)
-	sess.Touch()
-	sm.lru.MoveToFront(elem)
-	return sess, true
-}
-
-// Close 关闭并移除指定会话（持久化并释放资源）。
-func (sm *SessionManager) Close(id string) {
-	sm.mu.Lock()
-	elem, ok := sm.sessions[id]
-	if ok {
-		delete(sm.sessions, id)
-		sm.lru.Remove(elem)
-	}
-	sm.mu.Unlock()
-
-	if ok {
-		// 在锁外执行可能较慢的 Close（持久化 + 网络关闭）。
-		_ = elem.Value.(*Session).Close()
-	}
-}
-
-// CloseAll 关闭所有会话（进程退出时调用）。
-func (sm *SessionManager) CloseAll() {
-	sm.mu.Lock()
-	elems := make([]*list.Element, 0, len(sm.sessions))
-	for _, elem := range sm.sessions {
-		elems = append(elems, elem)
-	}
-	sm.sessions = make(map[string]*list.Element)
-	sm.lru.Init()
-	sm.mu.Unlock()
-
-	for _, elem := range elems {
-		s := elem.Value.(*Session)
-		if err := s.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "[警告] 关闭会话 %q 时出错: %v\n", s.ID, err)
-		}
-	}
+	return s.Persist()
 }
 
 // buildSummarizer 构造 compress 模式所需的摘要器，使用给定 Provider 将早期消息压缩为摘要文本。
@@ -293,7 +223,17 @@ func buildSummarizer(p provider.Provider) manager.Summarizer {
 		var prompt strings.Builder
 		prompt.WriteString("请将以下对话历史浓缩为简短摘要，保留关键信息和结论：\n\n")
 		for _, m := range msgs {
-			prompt.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, m.Content))
+			if m.Role == provider.RoleAssistant && len(m.ToolCalls) > 0 {
+				// assistant 消息可能仅含 tool_calls 而无文本内容，需单独输出工具调用。
+				if m.Content != "" {
+					prompt.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, m.Content))
+				}
+				for _, tc := range m.ToolCalls {
+					prompt.WriteString(fmt.Sprintf("[%s tool_call]: %s(%s)\n", m.Role, tc.Name, tc.Arguments))
+				}
+			} else {
+				prompt.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, m.Content))
+			}
 		}
 
 		stream, err := p.Chat(ctx, []provider.Message{
@@ -312,25 +252,4 @@ func buildSummarizer(p provider.Provider) manager.Summarizer {
 		}
 		return result.String(), nil
 	}
-}
-
-// evictIfNeededLocked 在超出 MaxSessions 时淘汰最久未活跃的会话（调用方需持有锁）。
-//
-// 收集需要淘汰的会话后，在返回前记录它们，由调用方在释放锁后执行 Close。
-func (sm *SessionManager) evictIfNeededLocked() []*Session {
-	if sm.config.MaxSessions <= 0 {
-		return nil
-	}
-	var evicted []*Session
-	for sm.lru.Len() > sm.config.MaxSessions {
-		oldest := sm.lru.Back()
-		if oldest == nil {
-			break
-		}
-		sess := oldest.Value.(*Session)
-		sm.lru.Remove(oldest)
-		delete(sm.sessions, sess.ID)
-		evicted = append(evicted, sess)
-	}
-	return evicted
 }

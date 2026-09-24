@@ -15,7 +15,6 @@ providers:
     type: openai                       # Provider 类型
     api_key: ${OPENAI_API_KEY}         # API 密钥（环境变量注入）
     base_url: https://api.openai.com/v1 # 可选：自定义 endpoint（代理/兼容网关）
-    timeout: 60s                       # 可选：请求超时
 
   claude:
     type: claude
@@ -168,12 +167,12 @@ tools:
 context_manager:
   mode: compress                       # compress：摘要压缩早期历史
   # ---- compress 相关 ----
-  max_tokens: 32000                    # 达到该 token 阈值触发压缩
-  compress_ratio: 0.5                  # 压缩目标比例（压缩到约一半）
+  max_rounds: 20                       # 超过该轮次阈值时触发摘要压缩
   # ---- truncate 相关（mode: truncate 时使用）----
   # max_rounds: 20                     # 保留的最大对话轮次
   # ---- window 相关（mode: window 时使用）----
   # max_tokens: 16000                  # token 滑动窗口上限
+  # compress_ratio: 0.8                # 用量超过 max_tokens*compress_ratio 时触发裁剪
 
 # ============================================================
 # server —— Web 服务模式配置（serve 子命令）

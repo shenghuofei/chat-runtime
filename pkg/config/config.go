@@ -14,6 +14,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -60,8 +61,8 @@ type ProviderConfig struct {
 	APIKey string `yaml:"api_key"`
 	// BaseURL 自定义 API endpoint（代理 / 私有部署 / 兼容网关）。
 	BaseURL string `yaml:"base_url"`
-	// Timeout 请求超时时间，如 60s、2m。
-	Timeout time.Duration `yaml:"timeout"`
+	// ExtraHeaders 额外的自定义请求头（如代理鉴权、路由标记等）。
+	ExtraHeaders map[string]string `yaml:"headers"`
 }
 
 // ModelConfig 描述一个模型，绑定 provider 并指定模型名与采样参数。
@@ -144,7 +145,7 @@ type CommandToolConfig struct {
 	Timeout string `yaml:"timeout"`
 }
 
-// FilesystemToolConfig 文件操作工具配置。
+// FilesystemToolConfig 文件操作工具配置（预留，当前未实现对应工具）。
 type FilesystemToolConfig struct {
 	// Enabled 是否启用文件操作工具。
 	Enabled bool `yaml:"enabled"`
@@ -162,6 +163,9 @@ type ServerConfig struct {
 	Port int `yaml:"port"`
 	// BasicAuth HTTP Basic Auth 配置。
 	BasicAuth BasicAuthConfig `yaml:"basic_auth"`
+
+	// MaxSessions Web 模式最大并发会话数，防止连接数无上限导致 DoS。默认 100（<=0 表示不限制）。
+	MaxSessions int `yaml:"max_sessions"`
 
 	// WebSocket 与审批超时配置（均有默认值，通常无需手动设置）。
 
@@ -250,7 +254,13 @@ func Load(path string) (*Config, error) {
 	}
 
 	// 1. 环境变量插值：将 ${VAR} 替换为对应环境变量的值。
-	expanded := expandEnv(raw)
+	expanded, undefined := expandEnv(raw)
+	if len(undefined) > 0 {
+		slog.Warn("配置中引用了未定义的环境变量，已替换为空字符串",
+			"path", path,
+			"variables", undefined,
+		)
+	}
 
 	// 2. YAML 反序列化。
 	var cfg Config
@@ -285,12 +295,61 @@ func Load(path string) (*Config, error) {
 }
 
 // expandEnv 将内容中的 ${VAR} 替换为环境变量的值（未定义则替换为空字符串）。
-func expandEnv(data []byte) []byte {
-	return envVarPattern.ReplaceAllFunc(data, func(match []byte) []byte {
+//
+// 第二个返回值是所有”在系统环境中未定义”的变量名列表（去重、按出现顺序），
+// 供上层在必要时发出警告，避免因变量拼写错误或漏配而静默替换为空串。
+//
+// 安全注意：若替换后的值含有 YAML 特殊字符（如 “ #”、”: “、”{“ 等），
+// 会用 YAML 单引号字符串包裹，防止破坏解析结构。对嵌入式用法
+// （如 “Bearer ${TOKEN}”）通常无影响，因为 API Key / JWT 仅含 base64url 字符集。
+func expandEnv(data []byte) ([]byte, []string) {
+	var undefined []string
+	seen := make(map[string]bool)
+	result := envVarPattern.ReplaceAllFunc(data, func(match []byte) []byte {
 		// match 形如 ${VAR}，截取中间的变量名。
 		name := string(match[2 : len(match)-1])
-		return []byte(os.Getenv(name))
+		val, ok := os.LookupEnv(name)
+		if !ok && !seen[name] {
+			seen[name] = true
+			undefined = append(undefined, name)
+		}
+		return yamlSafeEnvValue(val)
 	})
+	return result, undefined
+}
+
+// yamlSafeEnvValue 将环境变量的值转换为 YAML 安全的字节序列。
+//
+// 若值含有会被 YAML 解析器特殊处理的字符，则用单引号字符串包裹
+// （内部的单引号以两个连续单引号转义）。普通 API Key / URL / Path 不含这些字符，
+// 直接返回原始字节，不影响 “Bearer ${TOKEN}” 等复合字符串的拼接语义。
+func yamlSafeEnvValue(val string) []byte {
+	if needsYAMLQuoting(val) {
+		escaped := strings.ReplaceAll(val, "'", "''")
+		return []byte("'" + escaped + "'")
+	}
+	return []byte(val)
+}
+
+// needsYAMLQuoting 判断值是否需要 YAML 引号保护。
+func needsYAMLQuoting(val string) bool {
+	if val == "" {
+		return false
+	}
+	// “ #”（空格+井号）：YAML 解析器视后续内容为注释，导致值被静默截断。
+	if strings.Contains(val, " #") {
+		return true
+	}
+	// “: “（冒号+空格）：YAML 映射分隔符，可能引起结构混乱或解析错误。
+	if strings.Contains(val, ": ") {
+		return true
+	}
+	// 值以 YAML 流指示符或特殊首字符起始时，plain scalar 解析会出错。
+	switch val[0] {
+	case '{', '[', '!', '&', '*', '|', '>', '\'', '"', '%', '@', '`':
+		return true
+	}
+	return false
 }
 
 // templateVars 是 system 提示词可用的 Go 模板变量集合。
@@ -362,6 +421,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.Port == 0 {
 		c.Server.Port = 8080
+	}
+	if c.Server.MaxSessions == 0 {
+		c.Server.MaxSessions = 100
 	}
 	if c.Server.ApprovalTimeout == 0 {
 		c.Server.ApprovalTimeout = 5 * time.Minute

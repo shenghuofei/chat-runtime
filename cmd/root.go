@@ -14,12 +14,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/chzyer/readline"
 	"github.com/shenghuofei/chat-runtime/pkg/agent"
 	"github.com/shenghuofei/chat-runtime/pkg/config"
+	"github.com/shenghuofei/chat-runtime/pkg/store"
 	"github.com/spf13/cobra"
 )
 
@@ -47,6 +49,15 @@ var agentFactory AgentFactory
 
 // SetAgentFactory 供上层装配代码注册 Agent 工厂。
 func SetAgentFactory(f AgentFactory) { agentFactory = f }
+
+// StoreGetter 由上层注入，返回全局共享的 Store 实例。
+// serve 子命令用它获取 Store 传给 Server 的会话管理 API。
+type StoreGetter func() (store.Store, error)
+
+var storeGetter StoreGetter
+
+// SetStoreGetter 供上层注册 Store 获取函数。
+func SetStoreGetter(f StoreGetter) { storeGetter = f }
 
 // rootCmd 是 CLI 的根命令，默认进入交互式 REPL。
 var rootCmd = &cobra.Command{
@@ -105,9 +116,28 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("创建 Agent 失败: %w", err)
 	}
+	// 确保无论以何种方式退出（正常 /quit、Ctrl+D、panic）都执行资源清理：
+	// 持久化会话历史、关闭 MCP 客户端等。
 	if cleanup != nil {
-		defer cleanup()
+		defer func() {
+			if err := cleanup(); err != nil {
+				fmt.Fprintf(os.Stderr, "[警告] 清理资源时出错: %v\n", err)
+			}
+		}()
 	}
+
+	// 注册 SIGTERM 信号处理：不直接 os.Exit（会跳过 defer 导致会话未持久化），
+	// 而是通过 quitCh 通知主循环（REPL）优雅退出，从而正常执行 cleanup。
+	quitCh := make(chan struct{})
+	sigCleanup := make(chan os.Signal, 1)
+	signal.Notify(sigCleanup, syscall.SIGTERM)
+	go func() {
+		<-sigCleanup
+		fmt.Fprintln(os.Stderr, "\n收到 SIGTERM，正在清理资源...")
+		// 通知主循环退出，由 runREPL 感知后返回，触发 defer 链（cleanup）。
+		close(quitCh)
+	}()
+	defer signal.Stop(sigCleanup)
 
 	// CLI 模式使用终端审批处理器：在终端提示用户 Y/N 确认。
 	ag.SetApprovalHandler(agent.NewCLIApprovalHandler())
@@ -118,7 +148,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	}
 
 	// 否则进入交互式 REPL。
-	return runREPL(ag)
+	return runREPL(ag, quitCh)
 }
 
 // runOnce 执行一次性查询，将结果流式输出到标准输出。
@@ -135,7 +165,7 @@ func runOnce(ctx context.Context, ag *agent.Agent, query string) error {
 //
 // 关于 Ctrl+C 的处理：在生成过程中按 Ctrl+C 只取消"当前这一次生成"，
 // 而不是退出整个程序；空闲状态下按 Ctrl+C 或 Ctrl+D（或输入 /quit）退出。
-func runREPL(ag *agent.Agent) error {
+func runREPL(ag *agent.Agent, quitCh <-chan struct{}) error {
 	printBanner()
 
 	// 历史记录文件：存放在 ~/.chat-runtime/history。
@@ -154,18 +184,40 @@ func runREPL(ag *agent.Agent) error {
 	}
 	defer rl.Close()
 
+	// readline 的 Readline() 是阻塞调用，无法直接 select quitCh。
+	// 因此将其放入独立 goroutine，通过 channel 将结果送回主循环，
+	// 主循环同时监听 quitCh（SIGTERM 触发）以便优雅退出并执行 cleanup。
+	type readResult struct {
+		line string
+		err  error
+	}
+
 	for {
-		line, err := rl.Readline()
-		if err != nil {
-			if err == readline.ErrInterrupt || err == io.EOF {
+		lineCh := make(chan readResult, 1)
+		go func() {
+			line, err := rl.Readline()
+			lineCh <- readResult{line: line, err: err}
+		}()
+
+		var res readResult
+		select {
+		case <-quitCh:
+			// 收到 SIGTERM：优雅退出，返回后由上层 defer 执行 cleanup。
+			fmt.Println("\n再见 👋")
+			return nil
+		case res = <-lineCh:
+		}
+
+		if res.err != nil {
+			if res.err == readline.ErrInterrupt || res.err == io.EOF {
 				// Ctrl+C 或 Ctrl+D：优雅退出。
 				fmt.Println("\n再见 👋")
 				return nil
 			}
-			return err
+			return res.err
 		}
 
-		line = strings.TrimSpace(line)
+		line := strings.TrimSpace(res.line)
 		if line == "" {
 			continue
 		}
@@ -210,7 +262,17 @@ func runInteractiveTurn(ag *agent.Agent, input string) {
 
 	// 启动"思考中..."闪动动画
 	animDone := make(chan struct{})
+	// animExited 在动画 goroutine 退出时关闭，用于确保调用方在写 stdout 前
+	// 已等到 goroutine 完全退出，消除两端并发写 stdout 的竞态。
+	animExited := make(chan struct{})
+	// sync.Once 保证 animDone 只被 close 一次，避免重复 close 引发 panic。
+	var closeAnim sync.Once
+	closeAnimFn := func() { closeAnim.Do(func() { close(animDone) }) }
+	// 函数退出时：先通知动画停止，再等待其完全退出，防止 goroutine 泄漏。
+	defer func() { closeAnimFn(); <-animExited }()
+
 	go func() {
+		defer close(animExited) // goroutine 退出时通知等待方
 		dots := []string{".", "..", "..."}
 		i := 0
 		ticker := time.NewTicker(400 * time.Millisecond)
@@ -230,7 +292,8 @@ func runInteractiveTurn(ag *agent.Agent, input string) {
 	firstToken := true
 	if err := ag.Run(ctx, input, func(ev agent.Event) {
 		if firstToken && ev.Type == agent.EventToken {
-			close(animDone) // 停止动画
+			closeAnimFn() // 通知动画退出
+			<-animExited  // 等待动画 goroutine 完全退出，再写 stdout，消除竞态
 			// 清除整行，重新打印"助手 >"
 			fmt.Print("\r\033[K\033[1;32m助手 >\033[0m ")
 			firstToken = false
@@ -238,7 +301,7 @@ func runInteractiveTurn(ag *agent.Agent, input string) {
 		streamToTerminal(ev)
 	}); err != nil {
 		if firstToken {
-			close(animDone) // 出错时也要停止动画
+			closeAnimFn() // 出错时也要停止动画（defer 会等待退出）
 		}
 		if errors.Is(err, context.Canceled) {
 			// 用户主动取消，不视为错误。
@@ -247,6 +310,9 @@ func runInteractiveTurn(ag *agent.Agent, input string) {
 		fmt.Fprintf(os.Stderr, "\n\033[31m错误: %v\033[0m\n", err)
 		return
 	}
+	// 确保动画已完全退出后再写 stdout（无 token 输出时 firstToken 仍为 true）。
+	closeAnimFn()
+	<-animExited
 	fmt.Println()
 }
 
@@ -274,7 +340,12 @@ func streamToTerminal(ev agent.Event) {
 // handleSlashCommand 处理斜杠命令，返回 true 表示应退出程序。
 func handleSlashCommand(line string, ag *agent.Agent) (quit bool) {
 	// 只取第一个词作为命令。
-	cmd := strings.Fields(line)[0]
+	fields := strings.Fields(line)
+	// 纯 "/" 或仅含空白的输入会导致 fields 为空，直接返回避免越界 panic。
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := fields[0]
 	switch cmd {
 	case "/help", "/h":
 		printHelp()

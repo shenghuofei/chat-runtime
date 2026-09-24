@@ -15,21 +15,33 @@ const (
 	maxRetries = 3
 	// baseRetryDelay 指数退避的基础延迟。
 	baseRetryDelay = 500 * time.Millisecond
-	// requestTimeout 单次 HTTP 请求的整体超时时间。
-	requestTimeout = 5 * time.Minute
+	// responseHeaderTimeout 建连并收到响应首字节（响应头）的超时时间。
+	// 用于替代已弃用的整体请求超时：流式对话的整体耗时不应被限制，
+	// 但建连/首包阶段仍需超时保护，避免连接 hang 住。
+	responseHeaderTimeout = 30 * time.Second
 )
+
+// requestTimeout 已弃用：整体请求超时会截断长时间的流式响应，
+// 现改为 Timeout: 0（不限制整体时间，由 ctx 控制），
+// 并通过 Transport.ResponseHeaderTimeout 保证建连/首包超时。
+// const requestTimeout = 5 * time.Minute
 
 // newHTTPClient 创建一个配置了合理连接池参数的 HTTP 客户端。
 //
 // 所有 Provider 共用此函数，避免每个 Provider 使用默认的空 Transport
 // 导致连接池参数不优。
+//
+// Timeout 设为 0（不限制整体请求时间）：流式对话可能持续很久，
+// 整体超时会错误地截断长响应。请求的取消与超时应由传入的 ctx 控制。
+// 为避免连接在建连/首包阶段 hang 住，Transport 设置 ResponseHeaderTimeout。
 func newHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: requestTimeout,
+		Timeout: 0,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: responseHeaderTimeout,
 		},
 	}
 }

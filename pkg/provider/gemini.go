@@ -8,18 +8,19 @@
 //   - 工具调用使用 functionCall / functionResponse 而非 tool_calls
 //   - 流式响应格式完全不同（JSON 数组或 SSE，取决于端点）
 //
+// 本适配器通过嵌入 baseProvider 复用 HTTP 请求与重试逻辑。
+//
 // 参考文档: https://ai.google.dev/api/generate-content
 package provider
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -28,13 +29,9 @@ const (
 )
 
 // geminiProvider 实现 Google Gemini API 的 Provider。
+// 嵌入 baseProvider 复用 HTTP 与重试逻辑。
 type geminiProvider struct {
-	name         string
-	model        string
-	baseURL      string
-	apiKey       string
-	extraHeaders map[string]string
-	httpClient   *http.Client
+	baseProvider
 }
 
 // NewGeminiProvider 创建 Gemini 专用 Provider。
@@ -48,20 +45,15 @@ func NewGeminiProvider(cfg ProviderConfig) (Provider, error) {
 		model = defaultGeminiModel
 	}
 	return &geminiProvider{
-		name:         "gemini",
-		model:        model,
-		baseURL:      baseURL,
-		apiKey:       cfg.APIKey,
-		extraHeaders: cfg.ExtraHeaders,
-		httpClient:   newHTTPClient(),
+		baseProvider: baseProvider{
+			name:         "gemini",
+			model:        model,
+			baseURL:      baseURL,
+			apiKey:       cfg.APIKey,
+			extraHeaders: cfg.ExtraHeaders,
+			httpClient:   newHTTPClient(),
+		},
 	}, nil
-}
-
-func (p *geminiProvider) Name() string { return p.name }
-
-func (p *geminiProvider) Close() error {
-	p.httpClient.CloseIdleConnections()
-	return nil
 }
 
 // ---- Gemini 请求/响应结构体 ----
@@ -166,7 +158,16 @@ func (p *geminiProvider) Chat(ctx context.Context, messages []Message, tools []T
 		return nil, fmt.Errorf("gemini: 序列化请求体失败: %w", err)
 	}
 
-	resp, err := p.doWithRetry(ctx, payload)
+	// Gemini 鉴权改用 x-goog-api-key 请求头传递 API Key，
+	// 不再将 key 明文拼入 URL query，避免其出现在 URL / 日志 / 代理记录中。
+	// 通过 headerGoogleKey 让 setHeaders 设置该请求头；同时用 extraSetup 兜底确保设置。
+	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse",
+		p.baseURL, p.model)
+	resp, err := p.doWithRetry(ctx, url, payload, headerGoogleKey, func(req *http.Request) {
+		if p.apiKey != "" {
+			req.Header.Set("x-goog-api-key", p.apiKey)
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +208,7 @@ func (p *geminiProvider) convertMessages(messages []Message) (*geminiContent, []
 			}
 			// 工具调用转为 functionCall parts
 			for _, tc := range m.ToolCalls {
-				var args map[string]any
+				args := make(map[string]any)
 				if tc.Arguments != "" {
 					_ = json.Unmarshal([]byte(tc.Arguments), &args)
 				}
@@ -274,57 +275,6 @@ func (p *geminiProvider) convertTools(tools []ToolDef) []geminiToolDeclaration {
 	return []geminiToolDeclaration{{FunctionDeclarations: decls}}
 }
 
-// doWithRetry 带重试的 HTTP 请求
-func (p *geminiProvider) doWithRetry(ctx context.Context, payload []byte) (*http.Response, error) {
-	// Gemini 流式端点: streamGenerateContent?alt=sse&key=xxx
-	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s",
-		p.baseURL, p.model, p.apiKey)
-
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			if !retrySleep(ctx, attempt) {
-				return nil, ctx.Err()
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-		if err != nil {
-			return nil, fmt.Errorf("gemini: 构造请求失败: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "text/event-stream")
-		for k, v := range p.extraHeaders {
-			req.Header.Set(k, v)
-		}
-
-		resp, err := p.httpClient.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			lastErr = fmt.Errorf("gemini: 请求发送失败: %w", err)
-			continue
-		}
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return resp, nil
-		}
-
-		body := readErrorBody(resp)
-		_ = resp.Body.Close()
-
-		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
-			lastErr = fmt.Errorf("gemini: 服务端错误 (状态码 %d): %s", resp.StatusCode, truncateBody(body))
-			continue
-		}
-
-		return nil, fmt.Errorf("gemini: 请求被拒绝 (状态码 %d): %s", resp.StatusCode, truncateBody(body))
-	}
-
-	return nil, fmt.Errorf("gemini: 重试 %d 次后仍失败: %w", maxRetries, lastErr)
-}
-
 // streamResponse 解析 Gemini SSE 流
 //
 // Gemini SSE 格式（alt=sse 模式下）:
@@ -338,41 +288,21 @@ func (p *geminiProvider) streamResponse(ctx context.Context, resp *http.Response
 	defer resp.Body.Close()
 
 	reader := bufio.NewReader(resp.Body)
-	// 用于生成稳定的 tool_call ID
+	// 用于生成唯一的 tool_call ID。
+	// 加入 UnixNano 前缀防止同一会话多轮调用产生重复 ID（如每轮都有 call_1），
+	// 避免 NormalizeToolMessages 按 ID 配对时错配历史消息。
+	idPrefix := fmt.Sprintf("gc_%d", time.Now().UnixNano())
 	toolCallCounter := 0
 
-	for {
-		if ctx.Err() != nil {
-			sendResponse(ctx, out, StreamResponse{Err: ctx.Err()})
-			return
-		}
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			sendResponse(ctx, out, StreamResponse{Err: fmt.Errorf("gemini: 读取流失败: %w", err)})
-			return
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" || data == "[DONE]" {
-			continue
+	readSSELines(ctx, reader, func(data string) bool {
+		if data == "[DONE]" {
+			return true
 		}
 
 		var chunk geminiStreamResponse
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			sendResponse(ctx, out, StreamResponse{Err: fmt.Errorf("gemini: 解析数据块失败: %w", err)})
-			continue
+			return false
 		}
 
 		// 处理 candidates
@@ -390,7 +320,7 @@ func (p *geminiProvider) streamResponse(ctx context.Context, resp *http.Response
 					sendResponse(ctx, out, StreamResponse{
 						Delta: Delta{
 							ToolCalls: []ToolCall{{
-								ID:        fmt.Sprintf("call_%d", toolCallCounter),
+								ID:        fmt.Sprintf("%s_%d", idPrefix, toolCallCounter),
 								Name:      part.FunctionCall.Name,
 								Arguments: string(argsJSON),
 							}},
@@ -432,5 +362,8 @@ func (p *geminiProvider) streamResponse(ctx context.Context, resp *http.Response
 				},
 			})
 		}
-	}
+		return false
+	}, func(err error) {
+		sendResponse(ctx, out, StreamResponse{Err: fmt.Errorf("gemini: 读取流失败: %w", err)})
+	})
 }
